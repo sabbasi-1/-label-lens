@@ -1,6 +1,7 @@
 import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -113,6 +114,24 @@ class GuiSmokeTests(unittest.TestCase):
         QTest.mouseMove(canvas, end, delay=5)
         QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=end)
         self.assertEqual(len(window.current_record().boxes), 2)
+        self.assertTrue(canvas.draw_mode)
+        self.assertTrue(window.draw_action.isChecked())
+
+        second_start = QPoint(
+            int(image_rect.left() + image_rect.width() * 0.65),
+            int(image_rect.top() + image_rect.height() * 0.15),
+        )
+        second_end = QPoint(
+            int(image_rect.left() + image_rect.width() * 0.8),
+            int(image_rect.top() + image_rect.height() * 0.35),
+        )
+        QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=second_start)
+        QTest.mouseMove(canvas, second_end, delay=5)
+        QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=second_end)
+        self.assertEqual(len(window.current_record().boxes), 3)
+        self.assertTrue(canvas.draw_mode)
+        window.select_action.setChecked(True)
+        self.assertFalse(canvas.draw_mode)
 
         created = window.current_record().boxes[1]
         old_x = created.x
@@ -136,13 +155,13 @@ class GuiSmokeTests(unittest.TestCase):
 
         canvas.selected = 1
         window.delete_selected()
-        self.assertEqual(len(window.current_record().boxes), 1)
-        window.undo()
         self.assertEqual(len(window.current_record().boxes), 2)
+        window.undo()
+        self.assertEqual(len(window.current_record().boxes), 3)
         window.redo()
-        self.assertEqual(len(window.current_record().boxes), 1)
-        window.undo()
         self.assertEqual(len(window.current_record().boxes), 2)
+        window.undo()
+        self.assertEqual(len(window.current_record().boxes), 3)
         window.reload_current_labels()
         window.close()
 
@@ -154,8 +173,10 @@ class GuiSmokeTests(unittest.TestCase):
         window.auto_save_check.setChecked(True)
         window.canvas.selected = 0
         window.assign_class(1)
+        window.draw_action.setChecked(True)
         window.navigate(1)
         self.assertEqual(window.position, 1)
+        self.assertTrue(window.canvas.draw_mode)
         self.assertTrue(labels[0].read_text(encoding="utf-8").startswith("1 "))
         window.auto_save_check.setChecked(False)
         window.close()
@@ -193,6 +214,23 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIsNone(window._loader_thread)
         self.assertIsNotNone(window.dataset)
         self.assertEqual(len(window.dataset.records), 4)
+        window.close()
+
+    def test_clickable_label_path_saves_then_opens_current_file(self) -> None:
+        yaml_path, labels = self.make_dataset(
+            TEST_ROOT / "open-label", ["cat", "dog"]
+        )
+        window = self.open_test_window(yaml_path)
+        window.canvas.selected = 0
+        window.assign_class(1)
+        self.assertTrue(window.dirty)
+        with patch(
+            "yolo_reviewer.app.QDesktopServices.openUrl", return_value=True
+        ) as open_url:
+            window.open_current_label_file()
+        self.assertFalse(window.dirty)
+        self.assertTrue(labels[0].read_text(encoding="utf-8").startswith("1 "))
+        open_url.assert_called_once()
         window.close()
 
 

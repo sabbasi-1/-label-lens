@@ -13,6 +13,8 @@ annotations. It does not upload images or labels.
 - Clicks a box to open a searchable class-selection dialog.
 - Changes the selected box with single- or multi-digit class shortcuts.
 - Draws missing boxes and moves, resizes, or deletes existing boxes.
+- Keeps New Box mode active across repeated drawing and image navigation.
+- Opens the current YOLO label file from a clickable path in the sidebar.
 - Provides multi-step undo and redo for every annotation edit.
 - Navigates with the left/right arrow keys.
 - Offers optional auto-save when navigating or closing.
@@ -84,7 +86,9 @@ individual image files, lists, or text files containing image paths.
 | Assign any class ID | Type its digits; pause briefly or press Enter |
 | Move a box | Drag inside it |
 | Resize a box | Drag one of its four corner handles |
-| Draw a missing box | N, then drag over the object |
+| Select/edit mode | V or **Select / edit** |
+| Persistent new-box mode | N or **New box**, then drag repeatedly |
+| Leave new-box mode | V, **Select / edit**, or Escape |
 | Delete selected box | Delete |
 | Save current labels | Ctrl+S |
 | Toggle reviewed | R |
@@ -95,6 +99,11 @@ individual image files, lists, or text files containing image paths.
 Selecting overlapping boxes favors the smallest box under the pointer. The
 annotation list on the right can always be used for exact selection. Double-click
 an annotation in that list to search for a replacement class.
+
+The current `.txt` annotation path appears in the sidebar. Click it to open the
+file in the system's default text editor. If the image has unsaved annotation
+changes, the reviewer saves them first so the opened file reflects the current
+boxes and classes.
 
 ## Filtering images by class
 

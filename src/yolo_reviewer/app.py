@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import re
 import sys
 from dataclasses import dataclass
@@ -14,12 +15,15 @@ from PySide6.QtCore import (
     QThread,
     Qt,
     QTimer,
+    QUrl,
     Signal,
     Slot,
 )
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
     QColor,
+    QDesktopServices,
     QKeySequence,
     QPainter,
     QPen,
@@ -171,7 +175,6 @@ class ImageCanvas(QWidget):
     selection_changed = Signal(int)
     edit_committed = Signal(object, str)
     box_created = Signal(int, QPoint)
-    draw_finished = Signal()
 
     HANDLE_SIZE = 9.0
     MIN_BOX_SIZE = 0.002
@@ -433,7 +436,6 @@ class ImageCanvas(QWidget):
                     self.box_created.emit(
                         self.selected, event.globalPosition().toPoint()
                     )
-            self.draw_finished.emit()
             self.update()
             return
 
@@ -477,7 +479,6 @@ class MainWindow(QMainWindow):
         self.canvas.box_created.connect(self.show_class_picker)
         self.canvas.selection_changed.connect(self.select_canvas_box)
         self.canvas.edit_committed.connect(self.canvas_edit_committed)
-        self.canvas.draw_finished.connect(self.finish_draw_mode)
 
         self.annotation_list = QListWidget()
         self.annotation_list.currentRowChanged.connect(self.select_from_list)
@@ -510,8 +511,17 @@ class MainWindow(QMainWindow):
             lambda enabled: self.settings.setValue("auto_save", enabled)
         )
         self.counter = QLabel("No dataset open")
+        self.label_path_link = QLabel("No label file")
+        self.label_path_link.setWordWrap(True)
+        self.label_path_link.setTextFormat(Qt.TextFormat.RichText)
+        self.label_path_link.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        self.label_path_link.setOpenExternalLinks(False)
+        self.label_path_link.linkActivated.connect(self.open_current_label_file)
         self.edit_hint = QLabel(
-            "Click: relabel  •  Drag: move  •  Corner: resize  •  N: new  •  Del: delete"
+            "Select/edit: click to relabel, drag to move, corner to resize  •  "
+            "New box: drag repeatedly until you switch modes"
         )
         self.edit_hint.setWordWrap(True)
 
@@ -531,6 +541,8 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self.flagged_check)
         side_layout.addWidget(self.auto_save_check)
         side_layout.addWidget(self.edit_hint)
+        side_layout.addWidget(QLabel("Current label file (click to open)"))
+        side_layout.addWidget(self.label_path_link)
         side_layout.addWidget(QLabel("Annotations (double-click to relabel)"))
         side_layout.addWidget(self.annotation_list, 2)
         side_layout.addWidget(QLabel("Automatic checks (click to select box)"))
@@ -560,9 +572,21 @@ class MainWindow(QMainWindow):
         following.triggered.connect(lambda: self.navigate(1))
         toolbar.addAction(following)
         toolbar.addSeparator()
+        self.tool_actions = QActionGroup(self)
+        self.tool_actions.setExclusive(True)
+        self.select_action = QAction("Select / edit", self)
+        self.select_action.setCheckable(True)
+        self.select_action.setChecked(True)
+        self.select_action.setToolTip("Select, relabel, move, or resize boxes (V)")
         self.draw_action = QAction("New box", self)
         self.draw_action.setCheckable(True)
+        self.draw_action.setToolTip(
+            "Draw multiple boxes; stays active until another tool is selected (N)"
+        )
+        self.tool_actions.addAction(self.select_action)
+        self.tool_actions.addAction(self.draw_action)
         self.draw_action.toggled.connect(self.canvas.set_draw_mode)
+        toolbar.addAction(self.select_action)
         toolbar.addAction(self.draw_action)
         delete_action = QAction("Delete box", self)
         delete_action.triggered.connect(self.delete_selected)
@@ -585,6 +609,7 @@ class MainWindow(QMainWindow):
         self._action("R", self.toggle_reviewed)
         self._action("F", self.toggle_flagged)
         self._action("N", lambda: self.draw_action.setChecked(True))
+        self._action("V", lambda: self.select_action.setChecked(True))
         self._action("Delete", self.delete_selected)
         self._action("Ctrl+Z", self.undo)
         self._action("Ctrl+Y", self.redo)
@@ -851,7 +876,7 @@ class MainWindow(QMainWindow):
         record = self.current_record()
         if not record:
             return
-        self.cancel_transient_mode()
+        self.clear_digit_shortcut()
         self.canvas.set_image(record.image_path, record.boxes, self.dataset.names)
         self.refresh_sidebar()
         key = self.dataset.key(record)
@@ -897,6 +922,11 @@ class MainWindow(QMainWindow):
         record = self.current_record()
         if not record or not self.dataset:
             return
+        label_path = str(record.label_path)
+        self.label_path_link.setText(
+            f'<a href="open">{html.escape(label_path)}</a>'
+        )
+        self.label_path_link.setToolTip(label_path)
         selected = self.canvas.selected
         self.annotation_list.blockSignals(True)
         self.annotation_list.clear()
@@ -934,6 +964,27 @@ class MainWindow(QMainWindow):
             self.canvas.selected = index
             self.select_canvas_box(index)
             self.canvas.update()
+
+    def open_current_label_file(self, _link: str = "") -> None:
+        record = self.current_record()
+        if record is None:
+            return
+        if self.dirty and not self.save_current():
+            return
+        if not record.label_path.exists():
+            QMessageBox.information(
+                self,
+                "Label file does not exist",
+                "This image does not have a label file yet. Create an annotation "
+                "and save it before opening the file.",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(record.label_path))):
+            QMessageBox.warning(
+                self,
+                "Could not open label file",
+                "No application is configured to open .txt files.",
+            )
 
     def show_class_picker(
         self, box_index: int, global_position: QPoint | None = None
@@ -979,11 +1030,14 @@ class MainWindow(QMainWindow):
             return
         self.assign_class(value)
 
-    def cancel_transient_mode(self) -> None:
+    def clear_digit_shortcut(self) -> None:
         self._digit_buffer = ""
         self._digit_timer.stop()
-        if hasattr(self, "draw_action"):
-            self.draw_action.setChecked(False)
+
+    def cancel_transient_mode(self) -> None:
+        self.clear_digit_shortcut()
+        if hasattr(self, "select_action"):
+            self.select_action.setChecked(True)
 
     def assign_class(self, class_id: int, box_index: int | None = None) -> None:
         record = self.current_record()
@@ -1033,9 +1087,6 @@ class MainWindow(QMainWindow):
         record.boxes.pop(index)
         self.canvas.selected = min(index, len(record.boxes) - 1)
         self.commit_change(before, f"Deleted box {index + 1}")
-
-    def finish_draw_mode(self) -> None:
-        self.draw_action.setChecked(False)
 
     def _apply_history(self, entry: HistoryEntry, boxes: list[Box]) -> None:
         if entry.record_index != self.current_record_index():
