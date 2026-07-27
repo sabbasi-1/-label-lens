@@ -1,0 +1,348 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+import yaml
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+@dataclass
+class Box:
+    class_id: int
+    x: float
+    y: float
+    width: float
+    height: float
+
+    def serialize(self) -> str:
+        return (
+            f"{self.class_id} {self.x:.8g} {self.y:.8g} "
+            f"{self.width:.8g} {self.height:.8g}"
+        )
+
+
+@dataclass
+class AnnotationIssue:
+    kind: str
+    message: str
+    box_index: int | None = None
+
+
+@dataclass
+class ImageRecord:
+    image_path: Path
+    label_path: Path
+    boxes: list[Box] = field(default_factory=list)
+    issues: list[AnnotationIssue] = field(default_factory=list)
+
+
+@dataclass
+class ReviewState:
+    reviewed: set[str] = field(default_factory=set)
+    flagged: set[str] = field(default_factory=set)
+    last_image: str | None = None
+
+    @classmethod
+    def load(cls, path: Path) -> "ReviewState":
+        if not path.exists():
+            return cls()
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return cls(
+                reviewed=set(value.get("reviewed", [])),
+                flagged=set(value.get("flagged", [])),
+                last_image=value.get("last_image"),
+            )
+        except (OSError, ValueError, TypeError):
+            return cls()
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "reviewed": sorted(self.reviewed),
+            "flagged": sorted(self.flagged),
+            "last_image": self.last_image,
+        }
+        atomic_write(path, json.dumps(data, indent=2) + "\n", make_backup=False)
+
+
+@dataclass
+class Dataset:
+    root: Path
+    names: list[str]
+    records: list[ImageRecord]
+
+    @property
+    def state_path(self) -> Path:
+        return self.root / ".yolo-review-state.json"
+
+    def key(self, record: ImageRecord) -> str:
+        try:
+            return record.image_path.relative_to(self.root).as_posix()
+        except ValueError:
+            return str(record.image_path)
+
+
+def _class_names(raw: object) -> list[str]:
+    if isinstance(raw, list):
+        return [str(item) for item in raw]
+    if isinstance(raw, dict):
+        pairs = sorted(((int(key), str(value)) for key, value in raw.items()))
+        if not pairs:
+            return []
+        names = [str(i) for i in range(pairs[-1][0] + 1)]
+        for index, value in pairs:
+            names[index] = value
+        return names
+    return []
+
+
+def _images_from_source(source: Path, base: Path) -> Iterable[Path]:
+    source = source if source.is_absolute() else (base / source)
+    if source.is_dir():
+        yield from (
+            path for path in source.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+    elif source.is_file() and source.suffix.lower() == ".txt":
+        for line in source.read_text(encoding="utf-8").splitlines():
+            value = line.strip()
+            if value:
+                path = Path(value)
+                yield path if path.is_absolute() else (base / path)
+    elif source.is_file() and source.suffix.lower() in IMAGE_EXTENSIONS:
+        yield source
+
+
+def label_path_for(image_path: Path, root: Path) -> Path:
+    parts = list(image_path.parts)
+    image_positions = [i for i, part in enumerate(parts) if part.lower() == "images"]
+    if image_positions:
+        parts[image_positions[-1]] = "labels"
+        return Path(*parts).with_suffix(".txt")
+    try:
+        relative = image_path.relative_to(root)
+    except ValueError:
+        relative = Path(image_path.name)
+    return (root / "labels" / relative).with_suffix(".txt")
+
+
+def load_labels(path: Path, class_count: int) -> tuple[list[Box], list[AnnotationIssue]]:
+    boxes: list[Box] = []
+    issues: list[AnnotationIssue] = []
+    if not path.exists():
+        return boxes, [AnnotationIssue("missing-label", f"Missing label file: {path.name}")]
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return boxes, [AnnotationIssue("unreadable-label", str(exc))]
+
+    for line_number, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) != 5:
+            issues.append(AnnotationIssue(
+                "unsupported-row",
+                f"Line {line_number}: expected 5 values, found {len(fields)}",
+            ))
+            continue
+        try:
+            class_id = int(fields[0])
+            values = [float(value) for value in fields[1:]]
+        except ValueError:
+            issues.append(AnnotationIssue(
+                "malformed-row", f"Line {line_number}: values are not numeric"
+            ))
+            continue
+        box = Box(class_id, *values)
+        boxes.append(box)
+    issues.extend(validation_issues(boxes, class_count))
+    return boxes, issues
+
+
+def validation_issues(boxes: list[Box], class_count: int = 0) -> list[AnnotationIssue]:
+    issues: list[AnnotationIssue] = []
+    for box_index, box in enumerate(boxes):
+        values = (box.x, box.y, box.width, box.height)
+        class_id = box.class_id
+        if class_id < 0 or (class_count and class_id >= class_count):
+            issues.append(AnnotationIssue(
+                "unknown-class",
+                f"Box {box_index + 1}: class ID {class_id} is not defined",
+                box_index,
+            ))
+        if box.width <= 0 or box.height <= 0:
+            issues.append(AnnotationIssue(
+                "degenerate-box",
+                f"Box {box_index + 1}: width and height must be positive",
+                box_index,
+            ))
+        if any(value < 0 or value > 1 for value in values):
+            issues.append(AnnotationIssue(
+                "out-of-range",
+                f"Box {box_index + 1}: normalized values must be between 0 and 1",
+                box_index,
+            ))
+        if (
+            box.x - box.width / 2 < 0
+            or box.y - box.height / 2 < 0
+            or box.x + box.width / 2 > 1
+            or box.y + box.height / 2 > 1
+        ):
+            issues.append(AnnotationIssue(
+                "out-of-bounds",
+                f"Box {box_index + 1}: box extends beyond the image",
+                box_index,
+            ))
+    issues.extend(box_quality_issues(boxes))
+    return issues
+
+
+def _iou(a: Box, b: Box) -> float:
+    ax1, ay1 = a.x - a.width / 2, a.y - a.height / 2
+    ax2, ay2 = a.x + a.width / 2, a.y + a.height / 2
+    bx1, by1 = b.x - b.width / 2, b.y - b.height / 2
+    bx2, by2 = b.x + b.width / 2, b.y + b.height / 2
+    intersection = max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(
+        0.0, min(ay2, by2) - max(ay1, by1)
+    )
+    union = a.width * a.height + b.width * b.height - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def box_quality_issues(boxes: list[Box]) -> list[AnnotationIssue]:
+    issues: list[AnnotationIssue] = []
+    for index, box in enumerate(boxes):
+        area = box.width * box.height
+        if 0 < area < 0.0001:
+            issues.append(AnnotationIssue(
+                "tiny-box",
+                f"Box {index + 1}: covers less than 0.01% of the image",
+                index,
+            ))
+        if area > 0.9:
+            issues.append(AnnotationIssue(
+                "huge-box",
+                f"Box {index + 1}: covers more than 90% of the image",
+                index,
+            ))
+        short_side = min(box.width, box.height)
+        long_side = max(box.width, box.height)
+        if short_side > 0 and long_side / short_side > 15:
+            issues.append(AnnotationIssue(
+                "extreme-aspect-ratio",
+                f"Box {index + 1}: aspect ratio exceeds 15:1",
+                index,
+            ))
+    for i, first in enumerate(boxes):
+        for j in range(i + 1, len(boxes)):
+            second = boxes[j]
+            overlap = _iou(first, second)
+            if overlap >= 0.98:
+                issues.append(AnnotationIssue(
+                    "duplicate-box",
+                    f"Boxes {i + 1} and {j + 1} appear duplicated",
+                    i,
+                ))
+            elif overlap >= 0.85:
+                issues.append(AnnotationIssue(
+                    "high-overlap",
+                    f"Boxes {i + 1} and {j + 1} overlap by {overlap:.0%}",
+                    i,
+                ))
+    return issues
+
+
+def _find_yaml(directory: Path) -> Path | None:
+    for name in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml"):
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def discover_dataset(selected: Path) -> Dataset:
+    selected = selected.resolve()
+    yaml_path = selected if selected.is_file() else _find_yaml(selected)
+    names: list[str] = []
+    image_paths: set[Path] = set()
+
+    if yaml_path:
+        config = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+        names = _class_names(config.get("names"))
+        declared_root = Path(str(config.get("path", ".")))
+        root = declared_root if declared_root.is_absolute() else yaml_path.parent / declared_root
+        root = root.resolve()
+        for split in ("train", "val", "test"):
+            raw = config.get(split)
+            sources = raw if isinstance(raw, list) else ([raw] if raw else [])
+            for source in sources:
+                image_paths.update(
+                    path.resolve() for path in _images_from_source(Path(str(source)), root)
+                )
+    else:
+        root = selected if selected.is_dir() else selected.parent
+        image_paths.update(
+            path.resolve() for path in root.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            and "labels" not in {part.lower() for part in path.parts}
+        )
+
+    records: list[ImageRecord] = []
+    maximum_class = -1
+    for image_path in sorted(image_paths, key=lambda value: str(value).lower()):
+        label_path = label_path_for(image_path, root)
+        boxes, issues = load_labels(label_path, len(names))
+        if boxes:
+            maximum_class = max(maximum_class, max(box.class_id for box in boxes))
+        records.append(ImageRecord(image_path, label_path, boxes, issues))
+
+    if not names and maximum_class >= 0:
+        names = [f"class_{index}" for index in range(maximum_class + 1)]
+    return Dataset(root, names, records)
+
+
+def atomic_write(path: Path, content: str, *, make_backup: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if make_backup and path.exists():
+        backup = path.with_suffix(path.suffix + ".bak")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def save_labels(record: ImageRecord, class_count: int = 0) -> None:
+    unsafe_kinds = {"unsupported-row", "malformed-row", "unreadable-label"}
+    unsafe = [issue for issue in record.issues if issue.kind in unsafe_kinds]
+    if unsafe:
+        raise ValueError(
+            "This label file contains rows that are not standard YOLO detection "
+            "annotations. Saving is blocked to avoid deleting unsupported data. "
+            "See the Automatic checks panel."
+        )
+    content = "".join(f"{box.serialize()}\n" for box in record.boxes)
+    atomic_write(record.label_path, content)
+    record.issues = validation_issues(record.boxes, class_count)
