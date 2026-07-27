@@ -4,13 +4,20 @@ import json
 import os
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import yaml
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+ProgressCallback = Callable[[int, int, str], None]
+CancelCallback = Callable[[], bool]
+
+
+class DatasetLoadCancelled(Exception):
+    """Raised when a dataset discovery operation is cancelled."""
 
 
 @dataclass
@@ -41,6 +48,9 @@ class ImageRecord:
     label_path: Path
     boxes: list[Box] = field(default_factory=list)
     issues: list[AnnotationIssue] = field(default_factory=list)
+
+    def contains_any_class(self, class_ids: set[int]) -> bool:
+        return not class_ids or any(box.class_id in class_ids for box in self.boxes)
 
 
 @dataclass
@@ -270,7 +280,20 @@ def _find_yaml(directory: Path) -> Path | None:
     return None
 
 
-def discover_dataset(selected: Path) -> Dataset:
+def discover_dataset(
+    selected: Path,
+    progress: ProgressCallback | None = None,
+    cancelled: CancelCallback | None = None,
+) -> Dataset:
+    def report(current: int, total: int, message: str) -> None:
+        if progress is not None:
+            progress(current, total, message)
+
+    def check_cancelled() -> None:
+        if cancelled is not None and cancelled():
+            raise DatasetLoadCancelled()
+
+    report(0, 0, "Reading dataset configuration...")
     selected = selected.resolve()
     yaml_path = selected if selected.is_file() else _find_yaml(selected)
     names: list[str] = []
@@ -282,32 +305,77 @@ def discover_dataset(selected: Path) -> Dataset:
         declared_root = Path(str(config.get("path", ".")))
         root = declared_root if declared_root.is_absolute() else yaml_path.parent / declared_root
         root = root.resolve()
+        report(0, 0, "Discovering image files...")
         for split in ("train", "val", "test"):
             raw = config.get(split)
             sources = raw if isinstance(raw, list) else ([raw] if raw else [])
             for source in sources:
-                image_paths.update(
-                    path.resolve() for path in _images_from_source(Path(str(source)), root)
-                )
+                for path in _images_from_source(Path(str(source)), root):
+                    image_paths.add(path)
+                    if len(image_paths) % 1000 == 0:
+                        report(
+                            len(image_paths),
+                            0,
+                            f"Discovered {len(image_paths):,} images...",
+                        )
+                        check_cancelled()
     else:
         root = selected if selected.is_dir() else selected.parent
-        image_paths.update(
-            path.resolve() for path in root.rglob("*")
-            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-            and "labels" not in {part.lower() for part in path.parts}
-        )
+        report(0, 0, "Discovering image files...")
+        for path in root.rglob("*"):
+            if (
+                path.is_file()
+                and path.suffix.lower() in IMAGE_EXTENSIONS
+                and "labels" not in {part.lower() for part in path.parts}
+            ):
+                image_paths.add(path)
+                if len(image_paths) % 1000 == 0:
+                    report(
+                        len(image_paths),
+                        0,
+                        f"Discovered {len(image_paths):,} images...",
+                    )
+                    check_cancelled()
 
+    check_cancelled()
+    ordered_paths = sorted(image_paths, key=lambda value: str(value).lower())
+    total = len(ordered_paths)
+    report(0, total, f"Indexing annotations for {total:,} images...")
     records: list[ImageRecord] = []
     maximum_class = -1
-    for image_path in sorted(image_paths, key=lambda value: str(value).lower()):
+
+    def load_record(image_path: Path) -> ImageRecord:
         label_path = label_path_for(image_path, root)
         boxes, issues = load_labels(label_path, len(names))
-        if boxes:
-            maximum_class = max(maximum_class, max(box.class_id for box in boxes))
-        records.append(ImageRecord(image_path, label_path, boxes, issues))
+        return ImageRecord(image_path, label_path, boxes, issues)
+
+    worker_count = min(8, max(2, os.cpu_count() or 2))
+    batch_size = worker_count * 16
+    with ThreadPoolExecutor(
+        max_workers=worker_count, thread_name_prefix="yolo-index"
+    ) as executor:
+        for batch_start in range(0, total, batch_size):
+            check_cancelled()
+            batch = ordered_paths[batch_start:batch_start + batch_size]
+            for offset, record in enumerate(executor.map(load_record, batch), start=1):
+                records.append(record)
+                if record.boxes:
+                    maximum_class = max(
+                        maximum_class,
+                        max(box.class_id for box in record.boxes),
+                    )
+                current = batch_start + offset
+                if current == total or current % 25 == 0:
+                    report(
+                        current,
+                        total,
+                        f"Indexed {current:,} of {total:,} images",
+                    )
+                check_cancelled()
 
     if not names and maximum_class >= 0:
         names = [f"class_{index}" for index in range(maximum_class + 1)]
+    report(total, total, f"Loaded {total:,} images")
     return Dataset(root, names, records)
 
 

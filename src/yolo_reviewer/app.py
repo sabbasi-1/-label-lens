@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QObject,
+    QPoint,
+    QPointF,
+    QRectF,
+    QSettings,
+    QThread,
+    Qt,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -20,12 +32,15 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
+    QPushButton,
     QSplitter,
     QStatusBar,
     QToolBar,
@@ -37,6 +52,7 @@ from .core import (
     AnnotationIssue,
     Box,
     Dataset,
+    DatasetLoadCancelled,
     ImageRecord,
     ReviewState,
     discover_dataset,
@@ -60,6 +76,33 @@ class HistoryEntry:
     before: list[Box]
     after: list[Box]
     description: str
+
+
+class DatasetLoader(QObject):
+    progress = Signal(int, int, str)
+    loaded = Signal(object)
+    failed = Signal(str)
+    stopped = Signal()
+
+    def __init__(self, selected: Path) -> None:
+        super().__init__()
+        self.selected = selected
+        self.cancel_requested = False
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            dataset = discover_dataset(
+                self.selected,
+                progress=self.progress.emit,
+                cancelled=lambda: self.cancel_requested,
+            )
+        except DatasetLoadCancelled:
+            self.stopped.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.loaded.emit(dataset)
 
 
 class ClassPickerDialog(QDialog):
@@ -419,6 +462,10 @@ class MainWindow(QMainWindow):
         self.dirty = False
         self.undo_stack: list[HistoryEntry] = []
         self.redo_stack: list[HistoryEntry] = []
+        self.class_filter_ids: set[int] = set()
+        self._loader_thread: QThread | None = None
+        self._loader: DatasetLoader | None = None
+        self._load_progress_dialog: QProgressDialog | None = None
         self._digit_buffer = ""
         self._digit_timer = QTimer(self)
         self._digit_timer.setSingleShot(True)
@@ -442,6 +489,15 @@ class MainWindow(QMainWindow):
         self.filter_combo = QComboBox()
         self.filter_combo.addItems(["All images", "Unreviewed", "Flagged", "Suspicious"])
         self.filter_combo.currentIndexChanged.connect(self.rebuild_filter)
+        self.class_filter_edit = QLineEdit()
+        self.class_filter_edit.setPlaceholderText("e.g. 0, 3, helmet")
+        self.class_filter_edit.returnPressed.connect(self.apply_class_filter)
+        self.class_filter_apply = QPushButton("Apply")
+        self.class_filter_apply.clicked.connect(self.apply_class_filter)
+        self.class_filter_clear = QPushButton("Clear")
+        self.class_filter_clear.clicked.connect(self.clear_class_filter)
+        self.class_filter_status = QLabel("Showing all classes")
+        self.class_filter_status.setWordWrap(True)
         self.reviewed_check = QCheckBox("Reviewed")
         self.flagged_check = QCheckBox("Flagged")
         self.reviewed_check.clicked.connect(self.update_review_state)
@@ -463,6 +519,13 @@ class MainWindow(QMainWindow):
         side_layout = QVBoxLayout(side)
         side_layout.addWidget(QLabel("Queue"))
         side_layout.addWidget(self.filter_combo)
+        side_layout.addWidget(QLabel("Only images containing any of these classes"))
+        side_layout.addWidget(self.class_filter_edit)
+        class_filter_buttons = QHBoxLayout()
+        class_filter_buttons.addWidget(self.class_filter_apply)
+        class_filter_buttons.addWidget(self.class_filter_clear)
+        side_layout.addLayout(class_filter_buttons)
+        side_layout.addWidget(self.class_filter_status)
         side_layout.addWidget(self.counter)
         side_layout.addWidget(self.reviewed_check)
         side_layout.addWidget(self.flagged_check)
@@ -486,9 +549,9 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Main")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
-        open_action = QAction("Open dataset", self)
-        open_action.triggered.connect(self.open_dataset)
-        toolbar.addAction(open_action)
+        self.open_action = QAction("Open dataset", self)
+        self.open_action.triggered.connect(self.open_dataset)
+        toolbar.addAction(self.open_action)
         toolbar.addSeparator()
         previous = QAction("Previous", self)
         previous.triggered.connect(lambda: self.navigate(-1))
@@ -550,11 +613,71 @@ class MainWindow(QMainWindow):
             )
         if not selected:
             return
-        try:
-            dataset = discover_dataset(Path(selected))
-        except Exception as exc:
-            QMessageBox.critical(self, "Could not open dataset", str(exc))
+        self.start_dataset_load(Path(selected))
+
+    def start_dataset_load(self, selected: Path) -> None:
+        if self._loader_thread is not None:
             return
+        self.open_action.setEnabled(False)
+        progress_dialog = QProgressDialog(
+            "Reading dataset configuration...",
+            "Cancel",
+            0,
+            0,
+            self,
+        )
+        progress_dialog.setWindowTitle("Opening YOLO dataset")
+        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setAutoClose(False)
+        progress_dialog.setAutoReset(False)
+
+        thread = QThread(self)
+        loader = DatasetLoader(selected)
+        loader.moveToThread(thread)
+        thread.started.connect(loader.run)
+        loader.progress.connect(self.update_load_progress)
+        loader.loaded.connect(self.dataset_loaded)
+        loader.failed.connect(self.dataset_load_failed)
+        loader.stopped.connect(self.dataset_load_stopped)
+        loader.loaded.connect(thread.quit)
+        loader.failed.connect(thread.quit)
+        loader.stopped.connect(thread.quit)
+        loader.loaded.connect(loader.deleteLater)
+        loader.failed.connect(loader.deleteLater)
+        loader.stopped.connect(loader.deleteLater)
+        thread.finished.connect(self.finish_dataset_load)
+        thread.finished.connect(thread.deleteLater)
+        progress_dialog.canceled.connect(
+            lambda: self.request_dataset_load_cancel()
+        )
+
+        self._loader_thread = thread
+        self._loader = loader
+        self._load_progress_dialog = progress_dialog
+        progress_dialog.show()
+        thread.start()
+
+    @Slot(int, int, str)
+    def update_load_progress(self, current: int, total: int, message: str) -> None:
+        dialog = self._load_progress_dialog
+        if dialog is None:
+            return
+        dialog.setLabelText(message)
+        if total <= 0:
+            dialog.setRange(0, 0)
+        else:
+            dialog.setRange(0, total)
+            dialog.setValue(current)
+
+    def request_dataset_load_cancel(self) -> None:
+        if self._loader is not None:
+            self._loader.cancel_requested = True
+        if self._load_progress_dialog is not None:
+            self._load_progress_dialog.setLabelText("Cancelling dataset load...")
+
+    @Slot(object)
+    def dataset_loaded(self, dataset: Dataset) -> None:
         if not dataset.records:
             QMessageBox.warning(
                 self, "No images", "No supported images were discovered."
@@ -564,6 +687,9 @@ class MainWindow(QMainWindow):
         self.state = ReviewState.load(dataset.state_path)
         self.undo_stack.clear()
         self.redo_stack.clear()
+        self.class_filter_ids.clear()
+        self.class_filter_edit.clear()
+        self.class_filter_status.setText("Showing all classes")
         self.dirty = False
         self.rebuild_filter()
         target = next(
@@ -576,6 +702,29 @@ class MainWindow(QMainWindow):
             0,
         )
         self.show_position(target)
+        self.statusBar().showMessage(
+            f"Loaded {len(dataset.records):,} images and "
+            f"{sum(len(record.boxes) for record in dataset.records):,} annotations",
+            8000,
+        )
+
+    @Slot(str)
+    def dataset_load_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "Could not open dataset", message)
+
+    @Slot()
+    def dataset_load_stopped(self) -> None:
+        self.statusBar().showMessage("Dataset loading cancelled", 5000)
+
+    @Slot()
+    def finish_dataset_load(self) -> None:
+        if self._load_progress_dialog is not None:
+            self._load_progress_dialog.close()
+            self._load_progress_dialog.deleteLater()
+        self._load_progress_dialog = None
+        self._loader = None
+        self._loader_thread = None
+        self.open_action.setEnabled(True)
 
     def current_record(self) -> ImageRecord | None:
         if not self.dataset or not (0 <= self.position < len(self.visible_indices)):
@@ -586,6 +735,59 @@ class MainWindow(QMainWindow):
         if not (0 <= self.position < len(self.visible_indices)):
             return -1
         return self.visible_indices[self.position]
+
+    def apply_class_filter(self) -> None:
+        if not self.dataset:
+            return
+        tokens = [
+            token
+            for token in re.split(r"[\s,;]+", self.class_filter_edit.text().strip())
+            if token
+        ]
+        selected: set[int] = set()
+        invalid: list[str] = []
+        names_by_key = {
+            name.casefold(): class_id
+            for class_id, name in enumerate(self.dataset.names)
+        }
+        for token in tokens:
+            if token.lstrip("-").isdigit():
+                class_id = int(token)
+                if 0 <= class_id < len(self.dataset.names):
+                    selected.add(class_id)
+                else:
+                    invalid.append(token)
+            else:
+                class_id = names_by_key.get(token.casefold())
+                if class_id is None:
+                    invalid.append(token)
+                else:
+                    selected.add(class_id)
+        if invalid:
+            QMessageBox.warning(
+                self,
+                "Unknown classes",
+                "These class IDs or names were not found: " + ", ".join(invalid),
+            )
+            return
+        self.class_filter_ids = selected
+        if selected:
+            labels = [
+                f"{class_id}: {self.dataset.names[class_id]}"
+                for class_id in sorted(selected)
+            ]
+            self.class_filter_status.setText(
+                "Any of: " + ", ".join(labels)
+            )
+        else:
+            self.class_filter_status.setText("Showing all classes")
+        self.rebuild_filter()
+
+    def clear_class_filter(self) -> None:
+        self.class_filter_edit.clear()
+        self.class_filter_ids.clear()
+        self.class_filter_status.setText("Showing all classes")
+        self.rebuild_filter()
 
     def rebuild_filter(self) -> None:
         if not self.dataset:
@@ -601,7 +803,7 @@ class MainWindow(QMainWindow):
                 or (mode == "Flagged" and key in self.state.flagged)
                 or (mode == "Suspicious" and bool(record.issues))
             )
-            if include:
+            if include and record.contains_any_class(self.class_filter_ids):
                 indices.append(index)
         self.visible_indices = indices
         if not indices:
@@ -676,6 +878,9 @@ class MainWindow(QMainWindow):
             f"YOLO Annotation Reviewer{' *' if self.dirty else ''}"
         )
         self.filter_combo.setEnabled(not self.dirty)
+        self.class_filter_edit.setEnabled(not self.dirty)
+        self.class_filter_apply.setEnabled(not self.dirty)
+        self.class_filter_clear.setEnabled(not self.dirty)
 
     def _refresh_current_issues(self) -> None:
         record = self.current_record()
@@ -936,6 +1141,13 @@ class MainWindow(QMainWindow):
         self.update_review_state()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if self._loader_thread is not None:
+            self.request_dataset_load_cancel()
+            self.statusBar().showMessage(
+                "Cancelling dataset load before closing...", 5000
+            )
+            event.ignore()
+            return
         if self.maybe_save():
             event.accept()
         else:

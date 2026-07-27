@@ -3,6 +3,7 @@ from pathlib import Path
 
 from yolo_reviewer.core import (
     Box,
+    DatasetLoadCancelled,
     ReviewState,
     box_quality_issues,
     discover_dataset,
@@ -68,6 +69,36 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(
             label.with_suffix(".txt.bak").read_text(encoding="utf-8").startswith("0 ")
         )
+
+    def test_discovery_reports_progress_and_can_be_cancelled(self) -> None:
+        root = TEST_TEMP_ROOT / "progress"
+        image_dir = root / "images" / "train"
+        label_dir = root / "labels" / "train"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        label_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(3):
+            (image_dir / f"{index}.jpg").write_bytes(b"image")
+            (label_dir / f"{index}.txt").write_text(
+                f"{index % 2} 0.5 0.5 0.2 0.2\n", encoding="utf-8"
+            )
+        yaml_path = root / "data.yaml"
+        yaml_path.write_text(
+            "path: .\ntrain: images/train\nnames: [cat, dog]\n",
+            encoding="utf-8",
+        )
+        updates: list[tuple[int, int, str]] = []
+        dataset = discover_dataset(
+            yaml_path,
+            progress=lambda current, total, message: updates.append(
+                (current, total, message)
+            ),
+        )
+        self.assertEqual(len(dataset.records), 3)
+        self.assertEqual(updates[-1][0:2], (3, 3))
+        self.assertTrue(any("Index" in update[2] for update in updates))
+
+        with self.assertRaises(DatasetLoadCancelled):
+            discover_dataset(yaml_path, cancelled=lambda: True)
 
     def test_review_state_round_trip(self) -> None:
         root = TEST_TEMP_ROOT / "state"

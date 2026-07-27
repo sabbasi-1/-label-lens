@@ -6,7 +6,9 @@ annotations. It does not upload images or labels.
 ## Current capabilities
 
 - Opens a YOLO `data.yaml` or a dataset directory.
-- Discovers images and their corresponding YOLO `.txt` files.
+- Discovers images and indexes their corresponding YOLO `.txt` files in the
+  background with a visible, cancellable progress dialog.
+- Filters the review queue to images containing any requested class IDs or names.
 - Draws labeled bounding boxes over each image.
 - Clicks a box to open a searchable class-selection dialog.
 - Changes the selected box with single- or multi-digit class shortcuts.
@@ -93,6 +95,32 @@ individual image files, lists, or text files containing image paths.
 Selecting overlapping boxes favors the smallest box under the pointer. The
 annotation list on the right can always be used for exact selection. Double-click
 an annotation in that list to search for a replacement class.
+
+## Filtering images by class
+
+In the sidebar, enter one or more comma- or space-separated class IDs:
+
+```text
+0, 4, 11
+```
+
+Exact class names also work:
+
+```text
+helmet, vest
+```
+
+Press **Apply** or Enter. The resulting queue contains images with *any* of the
+requested classes. This combines with the queue selector, so choosing
+**Suspicious** plus classes `0, 4` shows suspicious images containing class 0 or
+class 4. Press **Clear** to show every class again.
+
+## Large datasets
+
+Opening a dataset no longer blocks the application window. Image discovery is
+shown as an indeterminate phase, followed by a determinate annotation-indexing
+bar. The operation can be cancelled. Label parsing uses a bounded worker pool to
+reduce startup time without creating one thread per image.
 
 ## Data safety
 

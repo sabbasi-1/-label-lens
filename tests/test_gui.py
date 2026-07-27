@@ -160,6 +160,41 @@ class GuiSmokeTests(unittest.TestCase):
         window.auto_save_check.setChecked(False)
         window.close()
 
+    def test_class_filter_matches_any_requested_id_or_name(self) -> None:
+        yaml_path, labels = self.make_dataset(
+            TEST_ROOT / "filter", ["helmet", "vest", "person"], image_count=3
+        )
+        labels[0].write_text("0 0.5 0.5 0.4 0.4\n", encoding="utf-8")
+        labels[1].write_text("1 0.5 0.5 0.4 0.4\n", encoding="utf-8")
+        labels[2].write_text("2 0.5 0.5 0.4 0.4\n", encoding="utf-8")
+        window = self.open_test_window(yaml_path)
+        window.class_filter_edit.setText("0, 2")
+        window.apply_class_filter()
+        self.assertEqual(len(window.visible_indices), 2)
+        self.assertEqual(window.class_filter_ids, {0, 2})
+        window.class_filter_edit.setText("vest")
+        window.apply_class_filter()
+        self.assertEqual(len(window.visible_indices), 1)
+        self.assertEqual(window.class_filter_ids, {1})
+        window.clear_class_filter()
+        self.assertEqual(len(window.visible_indices), 3)
+        window.close()
+
+    def test_background_loader_completes_without_blocking_window(self) -> None:
+        yaml_path, _labels = self.make_dataset(
+            TEST_ROOT / "background", ["cat", "dog"], image_count=4
+        )
+        window = MainWindow()
+        window.start_dataset_load(yaml_path)
+        for _ in range(200):
+            if window._loader_thread is None:
+                break
+            QTest.qWait(10)
+        self.assertIsNone(window._loader_thread)
+        self.assertIsNotNone(window.dataset)
+        self.assertEqual(len(window.dataset.records), 4)
+        window.close()
+
 
 if __name__ == "__main__":
     unittest.main()
