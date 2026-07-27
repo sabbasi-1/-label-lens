@@ -97,9 +97,9 @@ class GuiSmokeTests(unittest.TestCase):
             TEST_ROOT / "geometry", ["cat", "dog"]
         )
         window = self.open_test_window(yaml_path)
-        window.canvas.box_created.disconnect(window.show_class_picker)
         canvas = window.canvas
 
+        window.set_draw_class(1)
         window.draw_action.setChecked(True)
         image_rect = canvas._image_rect()
         start = QPoint(
@@ -114,6 +114,7 @@ class GuiSmokeTests(unittest.TestCase):
         QTest.mouseMove(canvas, end, delay=5)
         QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=end)
         self.assertEqual(len(window.current_record().boxes), 2)
+        self.assertEqual(window.current_record().boxes[-1].class_id, 1)
         self.assertTrue(canvas.draw_mode)
         self.assertTrue(window.draw_action.isChecked())
 
@@ -129,7 +130,26 @@ class GuiSmokeTests(unittest.TestCase):
         QTest.mouseMove(canvas, second_end, delay=5)
         QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=second_end)
         self.assertEqual(len(window.current_record().boxes), 3)
+        self.assertEqual(window.current_record().boxes[-1].class_id, 1)
         self.assertTrue(canvas.draw_mode)
+
+        window.queue_digit("0")
+        window.commit_digit_shortcut()
+        self.assertEqual(window.draw_class_id, 0)
+        third_start = QPoint(
+            int(image_rect.left() + image_rect.width() * 0.4),
+            int(image_rect.top() + image_rect.height() * 0.65),
+        )
+        third_end = QPoint(
+            int(image_rect.left() + image_rect.width() * 0.55),
+            int(image_rect.top() + image_rect.height() * 0.85),
+        )
+        QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=third_start)
+        QTest.mouseMove(canvas, third_end, delay=5)
+        QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=third_end)
+        self.assertEqual(len(window.current_record().boxes), 4)
+        self.assertEqual(window.current_record().boxes[-1].class_id, 0)
+
         window.select_action.setChecked(True)
         self.assertFalse(canvas.draw_mode)
 
@@ -155,13 +175,13 @@ class GuiSmokeTests(unittest.TestCase):
 
         canvas.selected = 1
         window.delete_selected()
-        self.assertEqual(len(window.current_record().boxes), 2)
-        window.undo()
         self.assertEqual(len(window.current_record().boxes), 3)
+        window.undo()
+        self.assertEqual(len(window.current_record().boxes), 4)
         window.redo()
-        self.assertEqual(len(window.current_record().boxes), 2)
-        window.undo()
         self.assertEqual(len(window.current_record().boxes), 3)
+        window.undo()
+        self.assertEqual(len(window.current_record().boxes), 4)
         window.reload_current_labels()
         window.close()
 
@@ -231,6 +251,44 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertFalse(window.dirty)
         self.assertTrue(labels[0].read_text(encoding="utf-8").startswith("1 "))
         open_url.assert_called_once()
+        window.close()
+
+    def test_first_new_box_class_is_reused_without_another_picker(self) -> None:
+        yaml_path, _labels = self.make_dataset(
+            TEST_ROOT / "reuse-draw-class", ["cat", "dog"]
+        )
+        window = self.open_test_window(yaml_path)
+        canvas = window.canvas
+        image_rect = canvas._image_rect()
+
+        def choose_dog(box_index: int, _position: QPoint) -> int:
+            window.assign_class(1, box_index)
+            return 1
+
+        with patch.object(
+            window, "show_class_picker", side_effect=choose_dog
+        ) as picker:
+            window.draw_action.setChecked(True)
+            for left in (0.1, 0.6):
+                start = QPoint(
+                    int(image_rect.left() + image_rect.width() * left),
+                    int(image_rect.top() + image_rect.height() * 0.1),
+                )
+                end = QPoint(
+                    int(image_rect.left() + image_rect.width() * (left + 0.15)),
+                    int(image_rect.top() + image_rect.height() * 0.3),
+                )
+                QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=start)
+                QTest.mouseMove(canvas, end, delay=5)
+                QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=end)
+
+        self.assertEqual(picker.call_count, 1)
+        self.assertEqual(window.draw_class_id, 1)
+        self.assertEqual(
+            [box.class_id for box in window.current_record().boxes[-2:]],
+            [1, 1],
+        )
+        window.reload_current_labels()
         window.close()
 
 

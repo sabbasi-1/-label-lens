@@ -189,6 +189,7 @@ class ImageCanvas(QWidget):
         self.names: list[str] = []
         self.selected = -1
         self.draw_mode = False
+        self.new_box_class_id = 0
         self._draw_rect = QRectF()
         self._interaction: str | None = None
         self._press_normalized = QPointF()
@@ -423,7 +424,7 @@ class ImageCanvas(QWidget):
                 ):
                     self.boxes.append(
                         Box(
-                            0,
+                            self.new_box_class_id,
                             (left + right) / 2,
                             (top + bottom) / 2,
                             right - left,
@@ -464,6 +465,7 @@ class MainWindow(QMainWindow):
         self.dirty = False
         self.undo_stack: list[HistoryEntry] = []
         self.redo_stack: list[HistoryEntry] = []
+        self.draw_class_id: int | None = None
         self.class_filter_ids: set[int] = set()
         self._loader_thread: QThread | None = None
         self._loader: DatasetLoader | None = None
@@ -476,7 +478,7 @@ class MainWindow(QMainWindow):
 
         self.canvas = ImageCanvas()
         self.canvas.box_clicked.connect(self.show_class_picker)
-        self.canvas.box_created.connect(self.show_class_picker)
+        self.canvas.box_created.connect(self.handle_box_created)
         self.canvas.selection_changed.connect(self.select_canvas_box)
         self.canvas.edit_committed.connect(self.canvas_edit_committed)
 
@@ -521,7 +523,7 @@ class MainWindow(QMainWindow):
         self.label_path_link.linkActivated.connect(self.open_current_label_file)
         self.edit_hint = QLabel(
             "Select/edit: click to relabel, drag to move, corner to resize  •  "
-            "New box: drag repeatedly until you switch modes"
+            "New box: active class is reused; press C or type an ID to change it"
         )
         self.edit_hint.setWordWrap(True)
 
@@ -588,6 +590,13 @@ class MainWindow(QMainWindow):
         self.draw_action.toggled.connect(self.canvas.set_draw_mode)
         toolbar.addAction(self.select_action)
         toolbar.addAction(self.draw_action)
+        self.draw_class_action = QAction("Draw class: choose...", self)
+        self.draw_class_action.setEnabled(False)
+        self.draw_class_action.setToolTip(
+            "Choose the class reused for every new box (C)"
+        )
+        self.draw_class_action.triggered.connect(self.choose_draw_class)
+        toolbar.addAction(self.draw_class_action)
         delete_action = QAction("Delete box", self)
         delete_action.triggered.connect(self.delete_selected)
         toolbar.addAction(delete_action)
@@ -610,6 +619,7 @@ class MainWindow(QMainWindow):
         self._action("F", self.toggle_flagged)
         self._action("N", lambda: self.draw_action.setChecked(True))
         self._action("V", lambda: self.select_action.setChecked(True))
+        self._action("C", self.choose_draw_class)
         self._action("Delete", self.delete_selected)
         self._action("Ctrl+Z", self.undo)
         self._action("Ctrl+Y", self.redo)
@@ -712,6 +722,10 @@ class MainWindow(QMainWindow):
         self.state = ReviewState.load(dataset.state_path)
         self.undo_stack.clear()
         self.redo_stack.clear()
+        self.draw_class_id = None
+        self.canvas.new_box_class_id = 0
+        self.draw_class_action.setText("Draw class: choose...")
+        self.draw_class_action.setEnabled(bool(dataset.names))
         self.class_filter_ids.clear()
         self.class_filter_edit.clear()
         self.class_filter_status.setText("Showing all classes")
@@ -988,10 +1002,10 @@ class MainWindow(QMainWindow):
 
     def show_class_picker(
         self, box_index: int, global_position: QPoint | None = None
-    ) -> None:
+    ) -> int | None:
         record = self.current_record()
         if not self.dataset or not record or not (0 <= box_index < len(record.boxes)):
-            return
+            return None
         dialog = ClassPickerDialog(
             self.dataset.names, record.boxes[box_index].class_id, self
         )
@@ -999,6 +1013,44 @@ class MainWindow(QMainWindow):
             class_id = dialog.selected_class()
             if class_id is not None:
                 self.assign_class(class_id, box_index)
+                return class_id
+        return None
+
+    def handle_box_created(self, box_index: int, position: QPoint) -> None:
+        if self.draw_class_id is not None:
+            self.statusBar().showMessage(
+                f"Created box with active class {self.draw_class_id}", 2500
+            )
+            return
+        class_id = self.show_class_picker(box_index, position)
+        if class_id is not None:
+            self.set_draw_class(class_id)
+
+    def set_draw_class(self, class_id: int) -> None:
+        if (
+            not self.dataset
+            or class_id < 0
+            or class_id >= len(self.dataset.names)
+        ):
+            return
+        self.draw_class_id = class_id
+        self.canvas.new_box_class_id = class_id
+        name = self.dataset.names[class_id]
+        self.draw_class_action.setText(f"Draw class: {class_id} - {name}")
+        self.statusBar().showMessage(
+            f"New boxes will use class {class_id}: {name}", 4000
+        )
+
+    def choose_draw_class(self) -> None:
+        if not self.dataset or not self.dataset.names:
+            return
+        current = self.draw_class_id if self.draw_class_id is not None else 0
+        dialog = ClassPickerDialog(self.dataset.names, current, self)
+        dialog.setWindowTitle("Choose class for new boxes")
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            class_id = dialog.selected_class()
+            if class_id is not None:
+                self.set_draw_class(class_id)
 
     def open_selected_picker(self) -> None:
         if self.canvas.selected >= 0:
@@ -1007,11 +1059,15 @@ class MainWindow(QMainWindow):
     def commit_or_open_picker(self) -> None:
         if self._digit_buffer:
             self.commit_digit_shortcut()
+        elif self.canvas.draw_mode:
+            self.choose_draw_class()
         else:
             self.open_selected_picker()
 
     def queue_digit(self, digit: str) -> None:
-        if self.canvas.selected < 0 or not self.dataset:
+        if not self.dataset or (
+            not self.canvas.draw_mode and self.canvas.selected < 0
+        ):
             return
         self._digit_buffer += digit
         self._digit_timer.start()
@@ -1028,7 +1084,10 @@ class MainWindow(QMainWindow):
         if not self.dataset or value >= len(self.dataset.names):
             self.statusBar().showMessage(f"Class ID {value} does not exist", 4000)
             return
-        self.assign_class(value)
+        if self.canvas.draw_mode:
+            self.set_draw_class(value)
+        else:
+            self.assign_class(value)
 
     def clear_digit_shortcut(self) -> None:
         self._digit_buffer = ""

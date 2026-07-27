@@ -14,6 +14,7 @@ annotations. It does not upload images or labels.
 - Changes the selected box with single- or multi-digit class shortcuts.
 - Draws missing boxes and moves, resizes, or deletes existing boxes.
 - Keeps New Box mode active across repeated drawing and image navigation.
+- Reuses the selected draw class for every following box until you change it.
 - Opens the current YOLO label file from a clickable path in the sidebar.
 - Provides multi-step undo and redo for every annotation edit.
 - Navigates with the left/right arrow keys.
@@ -88,6 +89,7 @@ individual image files, lists, or text files containing image paths.
 | Resize a box | Drag one of its four corner handles |
 | Select/edit mode | V or **Select / edit** |
 | Persistent new-box mode | N or **New box**, then drag repeatedly |
+| Change the active new-box class | C, **Draw class**, or type its ID |
 | Leave new-box mode | V, **Select / edit**, or Escape |
 | Delete selected box | Delete |
 | Save current labels | Ctrl+S |
@@ -104,6 +106,11 @@ The current `.txt` annotation path appears in the sidebar. Click it to open the
 file in the system's default text editor. If the image has unsaved annotation
 changes, the reviewer saves them first so the opened file reflects the current
 boxes and classes.
+
+When you draw the first new box, its selected label becomes the active draw class.
+Every later box uses that class without reopening the picker. While **New box** is
+active, type another class ID (or press `C`) to change the class used by subsequent
+boxes.
 
 ## Filtering images by class
 
