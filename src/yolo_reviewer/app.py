@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QStatusBar,
     QToolBar,
@@ -344,6 +345,25 @@ class ImageCanvas(QWidget):
         if normalized is None:
             return
         if self.draw_mode:
+            force_draw = bool(
+                event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            )
+            if (
+                not force_draw
+                and 0 <= self.selected < len(self.boxes)
+            ):
+                selected_rect = self._box_rect(self.boxes[self.selected])
+                handle = self._handle_at(event.position(), selected_rect)
+                if handle is not None or selected_rect.contains(event.position()):
+                    self._interaction = (
+                        f"resize-{handle}" if handle is not None else "move"
+                    )
+                    self._press_normalized = normalized
+                    self._start_box = copy_boxes([self.boxes[self.selected]])[0]
+                    self._before_boxes = copy_boxes(self.boxes)
+                    self._moved = False
+                    self.update()
+                    return
             self._draw_start = normalized
             self._draw_current = normalized
             self._before_boxes = copy_boxes(self.boxes)
@@ -492,6 +512,9 @@ class MainWindow(QMainWindow):
         self.filter_combo = QComboBox()
         self.filter_combo.addItems(["All images", "Unreviewed", "Flagged", "Suspicious"])
         self.filter_combo.currentIndexChanged.connect(self.rebuild_filter)
+        self.split_combo = QComboBox()
+        self.split_combo.addItem("All splits", "all")
+        self.split_combo.currentIndexChanged.connect(self.rebuild_filter)
         self.class_filter_edit = QLineEdit()
         self.class_filter_edit.setPlaceholderText("e.g. 0, 3, helmet")
         self.class_filter_edit.returnPressed.connect(self.apply_class_filter)
@@ -513,6 +536,14 @@ class MainWindow(QMainWindow):
             lambda enabled: self.settings.setValue("auto_save", enabled)
         )
         self.counter = QLabel("No dataset open")
+        self.jump_spin = QSpinBox()
+        self.jump_spin.setRange(1, 1)
+        self.jump_spin.setEnabled(False)
+        self.jump_spin.setKeyboardTracking(False)
+        self.jump_spin.lineEdit().returnPressed.connect(self.jump_to_position)
+        self.jump_button = QPushButton("Go")
+        self.jump_button.setEnabled(False)
+        self.jump_button.clicked.connect(self.jump_to_position)
         self.label_path_link = QLabel("No label file")
         self.label_path_link.setWordWrap(True)
         self.label_path_link.setTextFormat(Qt.TextFormat.RichText)
@@ -523,13 +554,15 @@ class MainWindow(QMainWindow):
         self.label_path_link.linkActivated.connect(self.open_current_label_file)
         self.edit_hint = QLabel(
             "Select/edit: click to relabel, drag to move, corner to resize  •  "
-            "New box: active class is reused; press C or type an ID to change it"
+            "New box: adjust the newest box directly; Shift-drag to overlap"
         )
         self.edit_hint.setWordWrap(True)
 
         side = QWidget()
         side_layout = QVBoxLayout(side)
         side_layout.addWidget(QLabel("Queue"))
+        side_layout.addWidget(QLabel("Dataset split"))
+        side_layout.addWidget(self.split_combo)
         side_layout.addWidget(self.filter_combo)
         side_layout.addWidget(QLabel("Only images containing any of these classes"))
         side_layout.addWidget(self.class_filter_edit)
@@ -539,6 +572,11 @@ class MainWindow(QMainWindow):
         side_layout.addLayout(class_filter_buttons)
         side_layout.addWidget(self.class_filter_status)
         side_layout.addWidget(self.counter)
+        side_layout.addWidget(QLabel("Jump to position in current queue"))
+        jump_layout = QHBoxLayout()
+        jump_layout.addWidget(self.jump_spin)
+        jump_layout.addWidget(self.jump_button)
+        side_layout.addLayout(jump_layout)
         side_layout.addWidget(self.reviewed_check)
         side_layout.addWidget(self.flagged_check)
         side_layout.addWidget(self.auto_save_check)
@@ -626,6 +664,7 @@ class MainWindow(QMainWindow):
         self._action("Ctrl+Shift+Z", self.redo)
         self._action("Return", self.commit_or_open_picker)
         self._action("Ctrl+L", self.open_selected_picker)
+        self._action("Ctrl+G", self.focus_jump)
         self._action("Escape", self.cancel_transient_mode)
         for digit in range(10):
             self._action(
@@ -720,6 +759,7 @@ class MainWindow(QMainWindow):
             return
         self.dataset = dataset
         self.state = ReviewState.load(dataset.state_path)
+        self.populate_split_selector(dataset)
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.draw_class_id = None
@@ -746,6 +786,30 @@ class MainWindow(QMainWindow):
             f"{sum(len(record.boxes) for record in dataset.records):,} annotations",
             8000,
         )
+
+    def populate_split_selector(self, dataset: Dataset) -> None:
+        labels = {
+            "train": "Train",
+            "val": "Validation",
+            "test": "Test",
+            "other": "Other / unspecified",
+        }
+        counts: dict[str, int] = {}
+        for record in dataset.records:
+            counts[record.split] = counts.get(record.split, 0) + 1
+        self.split_combo.blockSignals(True)
+        self.split_combo.clear()
+        self.split_combo.addItem(
+            f"All splits ({len(dataset.records):,})",
+            "all",
+        )
+        for split in dataset.available_splits:
+            self.split_combo.addItem(
+                f"{labels.get(split, split.title())} ({counts[split]:,})",
+                split,
+            )
+        self.split_combo.setCurrentIndex(0)
+        self.split_combo.blockSignals(False)
 
     @Slot(str)
     def dataset_load_failed(self, message: str) -> None:
@@ -774,6 +838,40 @@ class MainWindow(QMainWindow):
         if not (0 <= self.position < len(self.visible_indices)):
             return -1
         return self.visible_indices[self.position]
+
+    def focus_jump(self) -> None:
+        if self.jump_spin.isEnabled():
+            self.jump_spin.setFocus()
+            self.jump_spin.selectAll()
+
+    def jump_to_position(self) -> None:
+        if not self.visible_indices:
+            return
+        target = max(
+            0,
+            min(len(self.visible_indices) - 1, self.jump_spin.value() - 1),
+        )
+        if target == self.position:
+            return
+        if not self.maybe_save():
+            self.update_jump_control()
+            return
+        self.show_position(target)
+
+    def update_jump_control(self) -> None:
+        total = len(self.visible_indices)
+        enabled = total > 0
+        self.jump_spin.setEnabled(enabled)
+        self.jump_button.setEnabled(enabled)
+        if not enabled:
+            self.jump_spin.setRange(1, 1)
+            self.jump_spin.setSuffix(" / 0")
+            return
+        self.jump_spin.blockSignals(True)
+        self.jump_spin.setRange(1, total)
+        self.jump_spin.setSuffix(f" / {total:,}")
+        self.jump_spin.setValue(self.position + 1)
+        self.jump_spin.blockSignals(False)
 
     def apply_class_filter(self) -> None:
         if not self.dataset:
@@ -833,6 +931,7 @@ class MainWindow(QMainWindow):
             return
         current = self.current_record()
         mode = self.filter_combo.currentText()
+        selected_split = self.split_combo.currentData() or "all"
         indices: list[int] = []
         for index, record in enumerate(self.dataset.records):
             key = self.dataset.key(record)
@@ -842,12 +941,20 @@ class MainWindow(QMainWindow):
                 or (mode == "Flagged" and key in self.state.flagged)
                 or (mode == "Suspicious" and bool(record.issues))
             )
-            if include and record.contains_any_class(self.class_filter_ids):
+            split_matches = (
+                selected_split == "all" or record.split == selected_split
+            )
+            if (
+                include
+                and split_matches
+                and record.contains_any_class(self.class_filter_ids)
+            ):
                 indices.append(index)
         self.visible_indices = indices
         if not indices:
             self.position = -1
             self.counter.setText("No images match this filter")
+            self.update_jump_control()
             return
         if current is not None:
             current_index = self.dataset.records.index(current)
@@ -911,12 +1018,14 @@ class MainWindow(QMainWindow):
         if record:
             self.counter.setText(
                 f"{self.position + 1} / {len(self.visible_indices)}"
-                f"  -  {record.image_path.name}{suffix}"
+                f"  -  {record.image_path.name}  [{record.split}]{suffix}"
             )
+        self.update_jump_control()
         self.setWindowTitle(
             f"YOLO Annotation Reviewer{' *' if self.dirty else ''}"
         )
         self.filter_combo.setEnabled(not self.dirty)
+        self.split_combo.setEnabled(not self.dirty)
         self.class_filter_edit.setEnabled(not self.dirty)
         self.class_filter_apply.setEnabled(not self.dirty)
         self.class_filter_clear.setEnabled(not self.dirty)
@@ -1017,14 +1126,18 @@ class MainWindow(QMainWindow):
         return None
 
     def handle_box_created(self, box_index: int, position: QPoint) -> None:
-        if self.draw_class_id is not None:
-            self.statusBar().showMessage(
-                f"Created box with active class {self.draw_class_id}", 2500
-            )
+        record = self.current_record()
+        if record is None or not (0 <= box_index < len(record.boxes)):
             return
+        inherited_class = record.boxes[box_index].class_id
         class_id = self.show_class_picker(box_index, position)
-        if class_id is not None:
-            self.set_draw_class(class_id)
+        active_class = inherited_class if class_id is None else class_id
+        self.set_draw_class(active_class)
+        if class_id is None:
+            self.statusBar().showMessage(
+                f"Kept inherited class {active_class} for this and future boxes",
+                3000,
+            )
 
     def set_draw_class(self, class_id: int) -> None:
         if (

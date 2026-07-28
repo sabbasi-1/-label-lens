@@ -100,6 +100,33 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(DatasetLoadCancelled):
             discover_dataset(yaml_path, cancelled=lambda: True)
 
+    def test_discovery_preserves_declared_dataset_splits(self) -> None:
+        root = TEST_TEMP_ROOT / "splits"
+        for split in ("train", "valid", "test"):
+            image_dir = root / "images" / split
+            label_dir = root / "labels" / split
+            image_dir.mkdir(parents=True, exist_ok=True)
+            label_dir.mkdir(parents=True, exist_ok=True)
+            (image_dir / f"{split}.jpg").write_bytes(b"image")
+            (label_dir / f"{split}.txt").write_text(
+                "0 0.5 0.5 0.2 0.2\n", encoding="utf-8"
+            )
+        yaml_path = root / "data.yaml"
+        yaml_path.write_text(
+            "path: .\n"
+            "train: images/train\n"
+            "val: images/valid\n"
+            "test: images/test\n"
+            "names: [person]\n",
+            encoding="utf-8",
+        )
+        dataset = discover_dataset(yaml_path)
+        self.assertEqual(dataset.available_splits, ["train", "val", "test"])
+        self.assertEqual(
+            {record.image_path.stem: record.split for record in dataset.records},
+            {"train": "train", "valid": "val", "test": "test"},
+        )
+
     def test_review_state_round_trip(self) -> None:
         root = TEST_TEMP_ROOT / "state"
         root.mkdir(parents=True, exist_ok=True)

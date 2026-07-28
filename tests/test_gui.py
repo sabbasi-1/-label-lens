@@ -100,6 +100,7 @@ class GuiSmokeTests(unittest.TestCase):
         canvas = window.canvas
 
         window.set_draw_class(1)
+        canvas.box_created.disconnect(window.handle_box_created)
         window.draw_action.setChecked(True)
         image_rect = canvas._image_rect()
         start = QPoint(
@@ -236,6 +237,56 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(len(window.dataset.records), 4)
         window.close()
 
+    def test_split_filter_and_direct_position_jump(self) -> None:
+        root = TEST_ROOT / "split-jump"
+        image = QImage(320, 200, QImage.Format.Format_RGB32)
+        image.fill(0x38404A)
+        expected_counts = {"train": 3, "valid": 2, "test": 2}
+        for split, count in expected_counts.items():
+            image_dir = root / "images" / split
+            label_dir = root / "labels" / split
+            image_dir.mkdir(parents=True, exist_ok=True)
+            label_dir.mkdir(parents=True, exist_ok=True)
+            for index in range(count):
+                self.assertTrue(image.save(str(image_dir / f"{split}_{index}.png")))
+                (label_dir / f"{split}_{index}.txt").write_text(
+                    "0 0.5 0.5 0.4 0.4\n", encoding="utf-8"
+                )
+        yaml_path = root / "data.yaml"
+        yaml_path.write_text(
+            "path: .\n"
+            "train: images/train\n"
+            "val: images/valid\n"
+            "test: images/test\n"
+            "names: [person]\n",
+            encoding="utf-8",
+        )
+        window = MainWindow()
+        window.dataset = discover_dataset(yaml_path)
+        window.state = ReviewState()
+        window.populate_split_selector(window.dataset)
+        window.rebuild_filter()
+
+        test_index = window.split_combo.findData("test")
+        window.split_combo.setCurrentIndex(test_index)
+        self.assertEqual(len(window.visible_indices), 2)
+        self.assertTrue(all(
+            window.dataset.records[index].split == "test"
+            for index in window.visible_indices
+        ))
+        window.jump_spin.setValue(2)
+        window.jump_to_position()
+        self.assertEqual(window.position, 1)
+
+        train_index = window.split_combo.findData("train")
+        window.split_combo.setCurrentIndex(train_index)
+        self.assertEqual(len(window.visible_indices), 3)
+        window.jump_spin.setValue(3)
+        window.jump_to_position()
+        self.assertEqual(window.position, 2)
+        self.assertEqual(window.current_record().split, "train")
+        window.close()
+
     def test_clickable_label_path_saves_then_opens_current_file(self) -> None:
         yaml_path, labels = self.make_dataset(
             TEST_ROOT / "open-label", ["cat", "dog"]
@@ -253,7 +304,7 @@ class GuiSmokeTests(unittest.TestCase):
         open_url.assert_called_once()
         window.close()
 
-    def test_first_new_box_class_is_reused_without_another_picker(self) -> None:
+    def test_each_new_box_offers_class_override_and_cancel_keeps_inherited(self) -> None:
         yaml_path, _labels = self.make_dataset(
             TEST_ROOT / "reuse-draw-class", ["cat", "dog"]
         )
@@ -261,12 +312,14 @@ class GuiSmokeTests(unittest.TestCase):
         canvas = window.canvas
         image_rect = canvas._image_rect()
 
-        def choose_dog(box_index: int, _position: QPoint) -> int:
-            window.assign_class(1, box_index)
-            return 1
+        def choose_or_keep(box_index: int, _position: QPoint) -> int | None:
+            if window.draw_class_id is None:
+                window.assign_class(1, box_index)
+                return 1
+            return None
 
         with patch.object(
-            window, "show_class_picker", side_effect=choose_dog
+            window, "show_class_picker", side_effect=choose_or_keep
         ) as picker:
             window.draw_action.setChecked(True)
             for left in (0.1, 0.6):
@@ -282,12 +335,43 @@ class GuiSmokeTests(unittest.TestCase):
                 QTest.mouseMove(canvas, end, delay=5)
                 QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=end)
 
-        self.assertEqual(picker.call_count, 1)
+        self.assertEqual(picker.call_count, 2)
         self.assertEqual(window.draw_class_id, 1)
         self.assertEqual(
             [box.class_id for box in window.current_record().boxes[-2:]],
             [1, 1],
         )
+
+        newest = window.current_record().boxes[-1]
+        old_x = newest.x
+        center = canvas._box_rect(newest).center().toPoint()
+        moved_to = center + QPoint(20, 10)
+        QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=center)
+        QTest.mouseMove(canvas, moved_to, delay=5)
+        QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=moved_to)
+        self.assertGreater(newest.x, old_x)
+        self.assertTrue(canvas.draw_mode)
+
+        overlap_start = canvas._box_rect(newest).topLeft().toPoint() + QPoint(8, 8)
+        overlap_end = overlap_start + QPoint(20, 15)
+        with patch.object(
+            window, "show_class_picker", return_value=None
+        ) as overlap_picker:
+            QTest.mousePress(
+                canvas,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.ShiftModifier,
+                pos=overlap_start,
+            )
+            QTest.mouseMove(canvas, overlap_end, delay=5)
+            QTest.mouseRelease(
+                canvas,
+                Qt.MouseButton.LeftButton,
+                Qt.KeyboardModifier.ShiftModifier,
+                pos=overlap_end,
+            )
+        self.assertEqual(overlap_picker.call_count, 1)
+        self.assertEqual(window.current_record().boxes[-1].class_id, 1)
         window.reload_current_labels()
         window.close()
 

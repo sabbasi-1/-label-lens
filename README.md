@@ -9,6 +9,8 @@ annotations. It does not upload images or labels.
 - Discovers images and indexes their corresponding YOLO `.txt` files in the
   background with a visible, cancellable progress dialog.
 - Filters the review queue to images containing any requested class IDs or names.
+- Switches directly between Train, Validation, Test, and unspecified subsets.
+- Jumps directly to any numeric position in the currently filtered queue.
 - Draws labeled bounding boxes over each image.
 - Clicks a box to open a searchable class-selection dialog.
 - Changes the selected box with single- or multi-digit class shortcuts.
@@ -82,6 +84,8 @@ individual image files, lists, or text files containing image paths.
 | Action | Control |
 |---|---|
 | Previous / next image | Left / Right |
+| Choose dataset split | **Dataset split** selector |
+| Jump to queue position | Enter a number and press Enter, or Ctrl+G |
 | Select and relabel a box | Click the box |
 | Search classes for selected box | Enter or Ctrl+L |
 | Assign any class ID | Type its digits; pause briefly or press Enter |
@@ -90,6 +94,8 @@ individual image files, lists, or text files containing image paths.
 | Select/edit mode | V or **Select / edit** |
 | Persistent new-box mode | N or **New box**, then drag repeatedly |
 | Change the active new-box class | C, **Draw class**, or type its ID |
+| Adjust the newest box while drawing | Drag inside it or drag a corner |
+| Draw deliberately over the newest box | Hold Shift while dragging |
 | Leave new-box mode | V, **Select / edit**, or Escape |
 | Delete selected box | Delete |
 | Save current labels | Ctrl+S |
@@ -107,10 +113,11 @@ file in the system's default text editor. If the image has unsaved annotation
 changes, the reviewer saves them first so the opened file reflects the current
 boxes and classes.
 
-When you draw the first new box, its selected label becomes the active draw class.
-Every later box uses that class without reopening the picker. While **New box** is
-active, type another class ID (or press `C`) to change the class used by subsequent
-boxes.
+Every completed new box opens the class chooser with the active class already
+selected. Accept another class to change the box and make that class active for
+subsequent boxes, or cancel/close the chooser to keep the inherited class. While
+**New box** remains active, the newest box can be moved or resized directly
+without switching to Select/Edit mode.
 
 ## Filtering images by class
 
@@ -130,6 +137,16 @@ Press **Apply** or Enter. The resulting queue contains images with *any* of the
 requested classes. This combines with the queue selector, so choosing
 **Suspicious** plus classes `0, 4` shows suspicious images containing class 0 or
 class 4. Press **Clear** to show every class again.
+
+## Dataset splits and direct navigation
+
+When `data.yaml` declares `train`, `val`/`valid`, and `test` sources, the sidebar
+shows each available split with its image count. The split selector combines with
+the review-status and class filters.
+
+The jump field uses the current filtered queue. For example, after selecting
+**Train (20,000)** and entering `1000`, the reviewer opens the 1,000th matching
+training image. Press `Ctrl+G` to focus the field from the keyboard.
 
 ## Large datasets
 

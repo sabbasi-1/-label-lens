@@ -48,6 +48,7 @@ class ImageRecord:
     label_path: Path
     boxes: list[Box] = field(default_factory=list)
     issues: list[AnnotationIssue] = field(default_factory=list)
+    split: str = "other"
 
     def contains_any_class(self, class_ids: set[int]) -> bool:
         return not class_ids or any(box.class_id in class_ids for box in self.boxes)
@@ -98,6 +99,14 @@ class Dataset:
             return record.image_path.relative_to(self.root).as_posix()
         except ValueError:
             return str(record.image_path)
+
+    @property
+    def available_splits(self) -> list[str]:
+        order = {"train": 0, "val": 1, "test": 2, "other": 3}
+        return sorted(
+            {record.split for record in self.records},
+            key=lambda split: (order.get(split, 99), split),
+        )
 
 
 def _class_names(raw: object) -> list[str]:
@@ -280,6 +289,29 @@ def _find_yaml(directory: Path) -> Path | None:
     return None
 
 
+def _normalize_split(split: str) -> str:
+    lowered = split.casefold()
+    if lowered in {"val", "valid", "validation"}:
+        return "val"
+    if lowered in {"train", "training"}:
+        return "train"
+    if lowered in {"test", "testing"}:
+        return "test"
+    return "other"
+
+
+def _infer_split(image_path: Path, root: Path) -> str:
+    try:
+        parts = image_path.relative_to(root).parts
+    except ValueError:
+        parts = image_path.parts
+    for part in parts:
+        split = _normalize_split(part)
+        if split != "other":
+            return split
+    return "other"
+
+
 def discover_dataset(
     selected: Path,
     progress: ProgressCallback | None = None,
@@ -297,7 +329,7 @@ def discover_dataset(
     selected = selected.resolve()
     yaml_path = selected if selected.is_file() else _find_yaml(selected)
     names: list[str] = []
-    image_paths: set[Path] = set()
+    image_splits: dict[Path, str] = {}
 
     if yaml_path:
         config = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
@@ -306,17 +338,18 @@ def discover_dataset(
         root = declared_root if declared_root.is_absolute() else yaml_path.parent / declared_root
         root = root.resolve()
         report(0, 0, "Discovering image files...")
-        for split in ("train", "val", "test"):
-            raw = config.get(split)
+        for split_key in ("train", "val", "valid", "test"):
+            raw = config.get(split_key)
+            split = _normalize_split(split_key)
             sources = raw if isinstance(raw, list) else ([raw] if raw else [])
             for source in sources:
                 for path in _images_from_source(Path(str(source)), root):
-                    image_paths.add(path)
-                    if len(image_paths) % 1000 == 0:
+                    image_splits.setdefault(path, split)
+                    if len(image_splits) % 1000 == 0:
                         report(
-                            len(image_paths),
+                            len(image_splits),
                             0,
-                            f"Discovered {len(image_paths):,} images...",
+                            f"Discovered {len(image_splits):,} images...",
                         )
                         check_cancelled()
     else:
@@ -328,17 +361,17 @@ def discover_dataset(
                 and path.suffix.lower() in IMAGE_EXTENSIONS
                 and "labels" not in {part.lower() for part in path.parts}
             ):
-                image_paths.add(path)
-                if len(image_paths) % 1000 == 0:
+                image_splits.setdefault(path, _infer_split(path, root))
+                if len(image_splits) % 1000 == 0:
                     report(
-                        len(image_paths),
+                        len(image_splits),
                         0,
-                        f"Discovered {len(image_paths):,} images...",
+                        f"Discovered {len(image_splits):,} images...",
                     )
                     check_cancelled()
 
     check_cancelled()
-    ordered_paths = sorted(image_paths, key=lambda value: str(value).lower())
+    ordered_paths = sorted(image_splits, key=lambda value: str(value).lower())
     total = len(ordered_paths)
     report(0, total, f"Indexing annotations for {total:,} images...")
     records: list[ImageRecord] = []
@@ -347,7 +380,13 @@ def discover_dataset(
     def load_record(image_path: Path) -> ImageRecord:
         label_path = label_path_for(image_path, root)
         boxes, issues = load_labels(label_path, len(names))
-        return ImageRecord(image_path, label_path, boxes, issues)
+        return ImageRecord(
+            image_path,
+            label_path,
+            boxes,
+            issues,
+            image_splits[image_path],
+        )
 
     worker_count = min(8, max(2, os.cpu_count() or 2))
     batch_size = worker_count * 16
