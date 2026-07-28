@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from yolo_reviewer.core import (
     Box,
@@ -11,6 +12,7 @@ from yolo_reviewer.core import (
     discover_dataset,
     label_path_for,
     load_labels,
+    replace_class_in_records,
     save_labels,
     trash_record,
 )
@@ -195,6 +197,72 @@ class CoreTests(unittest.TestCase):
         self.assertTrue((trash / "train" / "images" / "one.jpg").exists())
         self.assertTrue((trash / "train" / "labels" / "one.txt").exists())
         self.assertTrue((trash / "train" / "labels" / "one.txt.bak").exists())
+
+    def test_bulk_class_replacement_saves_boxes_and_polygons(self) -> None:
+        root = TEST_TEMP_ROOT / "bulk-replace"
+        root.mkdir(parents=True, exist_ok=True)
+        first_label = root / "first.txt"
+        second_label = root / "second.txt"
+        first_label.write_text(
+            "1 0.5 0.5 0.2 0.2\n"
+            "1 0.1 0.1 0.3 0.1 0.3 0.3 0.1 0.3\n",
+            encoding="utf-8",
+        )
+        second_label.write_text(
+            "0 0.5 0.5 0.2 0.2\n1 0.7 0.7 0.1 0.1\n",
+            encoding="utf-8",
+        )
+        first_boxes, first_issues = load_labels(first_label, 3)
+        second_boxes, second_issues = load_labels(second_label, 3)
+        records = [
+            ImageRecord(root / "first.jpg", first_label, first_boxes, first_issues),
+            ImageRecord(
+                root / "second.jpg", second_label, second_boxes, second_issues
+            ),
+        ]
+        file_count, annotation_count, backup = replace_class_in_records(
+            records, 1, 2, 3, root
+        )
+        self.assertEqual((file_count, annotation_count), (2, 3))
+        self.assertTrue((backup / "manifest.json").exists())
+        self.assertEqual(
+            len(list((backup / "labels").rglob("*.txt"))),
+            2,
+        )
+        self.assertEqual(
+            [box.class_id for record in records for box in record.boxes],
+            [2, 2, 0, 2],
+        )
+        self.assertEqual(len(first_label.read_text(encoding="utf-8").splitlines()[1].split()), 9)
+
+    def test_bulk_class_replacement_rolls_back_every_file_on_failure(self) -> None:
+        root = TEST_TEMP_ROOT / "bulk-rollback"
+        root.mkdir(parents=True, exist_ok=True)
+        records: list[ImageRecord] = []
+        originals: dict[Path, str] = {}
+        for name in ("first", "second"):
+            label = root / f"{name}.txt"
+            original = "1 0.5 0.5 0.2 0.2\n"
+            label.write_text(original, encoding="utf-8")
+            boxes, issues = load_labels(label, 2)
+            records.append(ImageRecord(root / f"{name}.jpg", label, boxes, issues))
+            originals[label] = original
+        real_save = save_labels
+        call_count = 0
+
+        def fail_second(record: ImageRecord, class_count: int = 0) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise OSError("simulated write failure")
+            real_save(record, class_count)
+
+        with patch("yolo_reviewer.core.save_labels", side_effect=fail_second):
+            with self.assertRaises(OSError):
+                replace_class_in_records(records, 1, 0, 2)
+        self.assertEqual([record.boxes[0].class_id for record in records], [1, 1])
+        for label, original in originals.items():
+            self.assertEqual(label.read_text(encoding="utf-8"), original)
 
     def test_quality_checks_rank_unusual_geometry_as_suspicious(self) -> None:
         issues = box_quality_issues([

@@ -20,6 +20,8 @@ annotations. It does not upload images or labels.
 - Draws missing boxes and moves, resizes, or deletes existing boxes.
 - Keeps New Box mode active across repeated drawing and image navigation.
 - Reuses the selected draw class for every following box until you change it.
+- Replaces one annotation class with another in the current image, current split,
+  current image folder, or images matching a filename pattern.
 - Opens the current YOLO label file from a clickable path in the sidebar.
 - Provides multi-step undo and redo for every annotation edit.
 - Navigates with the left/right arrow keys.
@@ -112,6 +114,7 @@ individual image files, lists, or text files containing image paths.
 | Leave new-box mode | V, **Select / edit**, or Escape |
 | Delete selected box | Delete |
 | Move current image and label to dataset trash | Ctrl+Delete or **Delete image + label** |
+| Replace an annotation class | Ctrl+Shift+R or **Replace class...** |
 | Save current labels | Ctrl+S |
 | Toggle reviewed | R |
 | Toggle flagged | F |
@@ -132,6 +135,37 @@ selected. Accept another class to change the box and make that class active for
 subsequent boxes, or cancel/close the chooser to keep the inherited class. While
 **New box** remains active, the newest box can be moved or resized directly
 without switching to Select/Edit mode.
+
+## Bulk class replacement
+
+Choose **Replace class...** or press `Ctrl+Shift+R`, then select the source class,
+replacement class, and scope:
+
+- **Current image** changes only the open image and creates one normal undo step.
+- **Current split** targets every affected image in the current train, validation,
+  test, or unspecified split.
+- **Current image folder** targets images whose files share the current image
+  directory.
+- **Filename pattern** matches image filenames across the loaded dataset.
+
+Filename patterns support `*` for any number of characters and `?` for one
+character. For example, `camera_03_frame_*.jpg` targets that camera and numbering
+scheme without relying on an ambiguous automatically inferred prefix. The dialog
+prefills a pattern based on the current filename, which can be edited.
+
+Before confirmation, the reviewer reports the number of images matched, label
+files affected, and annotations that will change. Multi-file operations preflight
+every affected label, save each file atomically, and roll written files back if
+any save fails. They also preserve the exact pre-operation labels and a manifest
+under:
+
+```text
+<dataset>/.label-lens-bulk-backups/<unique-id>/
+```
+
+Current-image replacement follows the usual manual/auto-save behavior. Larger
+scopes are saved immediately after confirmation and clear the in-memory undo
+history; use their operation backup for recovery after completion.
 
 ## Filtering images by class
 

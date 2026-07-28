@@ -4,6 +4,7 @@ import html
 import re
 import sys
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -63,6 +65,7 @@ from .core import (
     ReviewState,
     discover_dataset,
     load_labels,
+    replace_class_in_records,
     save_labels,
     trash_record,
     validation_issues,
@@ -181,6 +184,94 @@ class ClassPickerDialog(QDialog):
         if item is None or item.isHidden():
             return None
         return int(item.data(Qt.ItemDataRole.UserRole))
+
+
+def suggested_filename_pattern(filename: str) -> str:
+    pattern = re.sub(
+        r"(?i)(?<=\.rf\.)[0-9a-f]{16,}",
+        "*",
+        filename,
+    )
+    pattern = re.sub(r"\d+", "*", pattern)
+    return re.sub(r"\*+", "*", pattern)
+
+
+class BulkClassReplaceDialog(QDialog):
+    def __init__(
+        self,
+        names: list[str],
+        record: ImageRecord,
+        current_class: int = 0,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Replace annotation class")
+        self.resize(560, 260)
+        self.source_combo = QComboBox()
+        self.target_combo = QComboBox()
+        for class_id, name in enumerate(names):
+            label = f"{class_id}: {name}"
+            self.source_combo.addItem(label, class_id)
+            self.target_combo.addItem(label, class_id)
+        source_index = self.source_combo.findData(current_class)
+        self.source_combo.setCurrentIndex(max(0, source_index))
+        if len(names) > 1:
+            self.target_combo.setCurrentIndex(
+                1 if self.source_combo.currentIndex() == 0 else 0
+            )
+
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItem("Current image", "current")
+        self.scope_combo.addItem(
+            f"Current split ({record.split})", "split"
+        )
+        self.scope_combo.addItem(
+            f"Current image folder ({record.image_path.parent.name})", "folder"
+        )
+        self.scope_combo.addItem(
+            "Images matching a filename pattern", "pattern"
+        )
+        self.pattern_edit = QLineEdit(
+            suggested_filename_pattern(record.image_path.name)
+        )
+        self.pattern_edit.setPlaceholderText("Example: frame_*.jpg")
+        self.pattern_edit.setEnabled(False)
+        self.scope_combo.currentIndexChanged.connect(
+            lambda: self.pattern_edit.setEnabled(
+                self.scope_combo.currentData() == "pattern"
+            )
+        )
+        explanation = QLabel(
+            "Use * to match any characters and ? to match one character. "
+            "A precise image and annotation count will be shown before files "
+            "are changed."
+        )
+        explanation.setWordWrap(True)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Continue")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        form = QFormLayout()
+        form.addRow("Replace:", self.source_combo)
+        form.addRow("With:", self.target_combo)
+        form.addRow("Scope:", self.scope_combo)
+        form.addRow("Filename pattern:", self.pattern_edit)
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(explanation)
+        layout.addWidget(buttons)
+
+    def values(self) -> tuple[int, int, str, str]:
+        return (
+            int(self.source_combo.currentData()),
+            int(self.target_combo.currentData()),
+            str(self.scope_combo.currentData()),
+            self.pattern_edit.text().strip(),
+        )
 
 
 class ImageCanvas(QWidget):
@@ -665,6 +756,13 @@ class MainWindow(QMainWindow):
         )
         self.draw_class_action.triggered.connect(self.choose_draw_class)
         toolbar.addAction(self.draw_class_action)
+        replace_class_action = QAction("Replace class...", self)
+        replace_class_action.setToolTip(
+            "Replace one class in the current image or a larger scope "
+            "(Ctrl+Shift+R)"
+        )
+        replace_class_action.triggered.connect(self.open_bulk_class_replace)
+        toolbar.addAction(replace_class_action)
         delete_action = QAction("Delete box", self)
         delete_action.triggered.connect(self.delete_selected)
         toolbar.addAction(delete_action)
@@ -701,6 +799,7 @@ class MainWindow(QMainWindow):
         self._action("Ctrl+Shift+Z", self.redo)
         self._action("Return", self.commit_or_open_picker)
         self._action("Ctrl+L", self.open_selected_picker)
+        self._action("Ctrl+Shift+R", self.open_bulk_class_replace)
         self._action("Ctrl+G", self.focus_jump)
         self._action("Escape", self.cancel_transient_mode)
         for digit in range(10):
@@ -1156,6 +1255,172 @@ class MainWindow(QMainWindow):
                 "Could not open label file",
                 "No application is configured to open .txt files.",
             )
+
+    def open_bulk_class_replace(self) -> None:
+        record = self.current_record()
+        if record is None or self.dataset is None:
+            return
+        if len(self.dataset.names) < 2:
+            QMessageBox.information(
+                self,
+                "Replacement unavailable",
+                "At least two dataset classes are required.",
+            )
+            return
+        current_class = (
+            record.boxes[self.canvas.selected].class_id
+            if 0 <= self.canvas.selected < len(record.boxes)
+            else (record.boxes[0].class_id if record.boxes else 0)
+        )
+        dialog = BulkClassReplaceDialog(
+            self.dataset.names,
+            record,
+            current_class,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.perform_bulk_class_replace(*dialog.values())
+
+    def _bulk_scope_records(
+        self, scope: str, filename_pattern: str = ""
+    ) -> tuple[list[ImageRecord], str]:
+        record = self.current_record()
+        if record is None or self.dataset is None:
+            return [], "current selection"
+        if scope == "current":
+            return [record], "the current image"
+        if scope == "split":
+            records = [
+                candidate
+                for candidate in self.dataset.records
+                if candidate.split == record.split
+            ]
+            return records, f"the {record.split} split"
+        if scope == "folder":
+            records = [
+                candidate
+                for candidate in self.dataset.records
+                if candidate.image_path.parent == record.image_path.parent
+            ]
+            return records, f"folder {record.image_path.parent}"
+        if scope == "pattern":
+            pattern = filename_pattern.casefold()
+            records = [
+                candidate
+                for candidate in self.dataset.records
+                if fnmatchcase(candidate.image_path.name.casefold(), pattern)
+            ]
+            return records, f'filename pattern "{filename_pattern}"'
+        return [], "unknown scope"
+
+    def perform_bulk_class_replace(
+        self,
+        source_class: int,
+        target_class: int,
+        scope: str,
+        filename_pattern: str = "",
+    ) -> bool:
+        if self.dataset is None:
+            return False
+        if source_class == target_class:
+            QMessageBox.warning(
+                self,
+                "Choose different classes",
+                "The replacement class must differ from the source class.",
+            )
+            return False
+        if scope == "pattern" and not filename_pattern:
+            QMessageBox.warning(
+                self,
+                "Filename pattern required",
+                "Enter a filename pattern such as frame_*.jpg.",
+            )
+            return False
+        if scope != "current" and self.dirty and not self.maybe_save():
+            return False
+
+        records, scope_description = self._bulk_scope_records(
+            scope, filename_pattern
+        )
+        affected = [
+            candidate
+            for candidate in records
+            if any(box.class_id == source_class for box in candidate.boxes)
+        ]
+        annotation_count = sum(
+            box.class_id == source_class
+            for candidate in affected
+            for box in candidate.boxes
+        )
+        if not annotation_count:
+            QMessageBox.information(
+                self,
+                "Nothing to replace",
+                f"No class {source_class} annotations were found in "
+                f"{scope_description}.",
+            )
+            return False
+        source_name = self.dataset.names[source_class]
+        target_name = self.dataset.names[target_class]
+        choice = QMessageBox.question(
+            self,
+            "Confirm class replacement",
+            f"Replace {annotation_count:,} annotation(s) from "
+            f"[{source_class}] {source_name} to [{target_class}] "
+            f"{target_name}?\n\nScope: {scope_description}\n"
+            f"Images matched by scope: {len(records):,}\n"
+            f"Label files affected: {len(affected):,}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return False
+
+        if scope == "current":
+            record = affected[0]
+            before = copy_boxes(record.boxes)
+            for box in record.boxes:
+                if box.class_id == source_class:
+                    box.class_id = target_class
+            self.commit_change(
+                before,
+                f"Replaced {annotation_count} {source_name} annotation(s) "
+                f"with {target_name}",
+            )
+            return True
+
+        try:
+            file_count, replaced_count, backup_path = replace_class_in_records(
+                affected,
+                source_class,
+                target_class,
+                len(self.dataset.names),
+                self.dataset.root,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            QMessageBox.critical(self, "Replacement failed", str(exc))
+            return False
+        self.dirty = False
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.rebuild_filter()
+        self.refresh_sidebar()
+        self.canvas.update()
+        self.statusBar().showMessage(
+            f"Replaced {replaced_count:,} annotation(s) across "
+            f"{file_count:,} label file(s)",
+            10000,
+        )
+        QMessageBox.information(
+            self,
+            "Class replacement complete",
+            f"Replaced {replaced_count:,} annotation(s) across "
+            f"{file_count:,} label file(s).\n\n"
+            f"Pre-operation labels and a restore manifest were saved to:\n"
+            f"{backup_path}",
+        )
+        return True
 
     def show_class_picker(
         self, box_index: int, global_position: QPoint | None = None

@@ -10,7 +10,11 @@ from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from yolo_reviewer.app import ClassPickerDialog, MainWindow
+from yolo_reviewer.app import (
+    ClassPickerDialog,
+    MainWindow,
+    suggested_filename_pattern,
+)
 from yolo_reviewer.core import ReviewState, discover_dataset
 
 TEST_ROOT = Path(__file__).parent / ".tmp" / "gui"
@@ -325,6 +329,76 @@ class GuiSmokeTests(unittest.TestCase):
             for path in trash_root.rglob(image_path.name)
         ))
         self.assertEqual(window.counter.text(), "No images match this filter")
+        window.close()
+
+    def test_current_image_class_replacement_is_one_undoable_edit(self) -> None:
+        yaml_path, labels = self.make_dataset(
+            TEST_ROOT / "replace-current", ["helmet", "vest"], image_count=2
+        )
+        labels[0].write_text(
+            "0 0.3 0.3 0.2 0.2\n0 0.7 0.7 0.2 0.2\n",
+            encoding="utf-8",
+        )
+        window = self.open_test_window(yaml_path)
+        with patch(
+            "yolo_reviewer.app.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.assertTrue(
+                window.perform_bulk_class_replace(0, 1, "current")
+            )
+        self.assertEqual(
+            [box.class_id for box in window.current_record().boxes],
+            [1, 1],
+        )
+        self.assertEqual(len(window.undo_stack), 1)
+        self.assertTrue(window.dirty)
+        window.undo()
+        self.assertEqual(
+            [box.class_id for box in window.current_record().boxes],
+            [0, 0],
+        )
+        window.reload_current_labels()
+        window.close()
+
+    def test_split_class_replacement_saves_every_affected_label(self) -> None:
+        yaml_path, labels = self.make_dataset(
+            TEST_ROOT / "replace-split", ["helmet", "vest"], image_count=3
+        )
+        window = self.open_test_window(yaml_path)
+        with patch(
+            "yolo_reviewer.app.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ), patch("yolo_reviewer.app.QMessageBox.information"):
+            self.assertTrue(
+                window.perform_bulk_class_replace(0, 1, "split")
+            )
+        self.assertTrue(all(
+            label.read_text(encoding="utf-8").startswith("1 ")
+            for label in labels
+        ))
+        self.assertFalse(window.dirty)
+        self.assertFalse(window.undo_stack)
+        window.close()
+
+    def test_filename_pattern_scope_is_predictable(self) -> None:
+        yaml_path, _labels = self.make_dataset(
+            TEST_ROOT / "replace-pattern", ["helmet", "vest"], image_count=3
+        )
+        window = self.open_test_window(yaml_path)
+        records, _description = window._bulk_scope_records(
+            "pattern", "sample_[01].png"
+        )
+        self.assertEqual(
+            {record.image_path.name for record in records},
+            {"sample_0.png", "sample_1.png"},
+        )
+        self.assertEqual(
+            suggested_filename_pattern(
+                "img_005653_flux_dev_jpg.rf.548700f5d5dcfcdf.jpg"
+            ),
+            "img_*_flux_dev_jpg.rf.*.jpg",
+        )
         window.close()
 
     def test_each_new_box_offers_class_override_and_cancel_keeps_inherited(self) -> None:
