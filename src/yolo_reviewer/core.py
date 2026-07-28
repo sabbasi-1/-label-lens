@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,11 +28,36 @@ class Box:
     y: float
     width: float
     height: float
+    polygon: tuple[tuple[float, float], ...] | None = None
 
     def serialize(self) -> str:
+        if self.polygon is not None:
+            left = self.x - self.width / 2
+            top = self.y - self.height / 2
+            coordinates = (
+                coordinate
+                for point in self.polygon
+                for coordinate in (
+                    left + point[0] * self.width,
+                    top + point[1] * self.height,
+                )
+            )
+            return f"{self.class_id} " + " ".join(
+                f"{coordinate:.8g}" for coordinate in coordinates
+            )
         return (
             f"{self.class_id} {self.x:.8g} {self.y:.8g} "
             f"{self.width:.8g} {self.height:.8g}"
+        )
+
+    def polygon_points(self) -> tuple[tuple[float, float], ...]:
+        if self.polygon is None:
+            return ()
+        left = self.x - self.width / 2
+        top = self.y - self.height / 2
+        return tuple(
+            (left + x * self.width, top + y * self.height)
+            for x, y in self.polygon
         )
 
 
@@ -135,7 +161,9 @@ def _images_from_source(source: Path, base: Path) -> Iterable[Path]:
             value = line.strip()
             if value:
                 path = Path(value)
-                yield path if path.is_absolute() else (base / path)
+                path = path if path.is_absolute() else (base / path)
+                if path.is_file():
+                    yield path
     elif source.is_file() and source.suffix.lower() in IMAGE_EXTENSIONS:
         yield source
 
@@ -168,10 +196,13 @@ def load_labels(path: Path, class_count: int) -> tuple[list[Box], list[Annotatio
         if not line:
             continue
         fields = line.split()
-        if len(fields) != 5:
+        is_detection = len(fields) == 5
+        is_segmentation = len(fields) >= 7 and len(fields) % 2 == 1
+        if not is_detection and not is_segmentation:
             issues.append(AnnotationIssue(
                 "unsupported-row",
-                f"Line {line_number}: expected 5 values, found {len(fields)}",
+                f"Line {line_number}: expected a YOLO box or polygon, "
+                f"found {len(fields)} values",
             ))
             continue
         try:
@@ -182,7 +213,31 @@ def load_labels(path: Path, class_count: int) -> tuple[list[Box], list[Annotatio
                 "malformed-row", f"Line {line_number}: values are not numeric"
             ))
             continue
-        box = Box(class_id, *values)
+        if is_detection:
+            box = Box(class_id, *values)
+        else:
+            points = list(zip(values[::2], values[1::2]))
+            left = min(point[0] for point in points)
+            right = max(point[0] for point in points)
+            top = min(point[1] for point in points)
+            bottom = max(point[1] for point in points)
+            width = right - left
+            height = bottom - top
+            relative_points = tuple(
+                (
+                    (x - left) / width if width else 0.5,
+                    (y - top) / height if height else 0.5,
+                )
+                for x, y in points
+            )
+            box = Box(
+                class_id,
+                (left + right) / 2,
+                (top + bottom) / 2,
+                width,
+                height,
+                relative_points,
+            )
         boxes.append(box)
     issues.extend(validation_issues(boxes, class_count))
     return boxes, issues
@@ -360,6 +415,9 @@ def discover_dataset(
                 path.is_file()
                 and path.suffix.lower() in IMAGE_EXTENSIONS
                 and "labels" not in {part.lower() for part in path.parts}
+                and ".label-lens-trash" not in {
+                    part.lower() for part in path.parts
+                }
             ):
                 image_splits.setdefault(path, _infer_split(path, root))
                 if len(image_splits) % 1000 == 0:
@@ -453,3 +511,34 @@ def save_labels(record: ImageRecord, class_count: int = 0) -> None:
     content = "".join(f"{box.serialize()}\n" for box in record.boxes)
     atomic_write(record.label_path, content)
     record.issues = validation_issues(record.boxes, class_count)
+
+
+def trash_record(dataset: Dataset, record: ImageRecord) -> Path:
+    """Move an image, its label, and label backup to recoverable local trash."""
+    trash_root = dataset.root / ".label-lens-trash" / uuid.uuid4().hex
+    sources = [
+        path
+        for path in (
+            record.image_path,
+            record.label_path,
+            record.label_path.with_suffix(record.label_path.suffix + ".bak"),
+        )
+        if path.exists()
+    ]
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for source in sources:
+            try:
+                relative = source.relative_to(dataset.root)
+            except ValueError:
+                relative = Path("external") / source.name
+            destination = trash_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+            moved.append((source, destination))
+    except BaseException:
+        for source, destination in reversed(moved):
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(destination), str(source))
+        raise
+    return trash_root

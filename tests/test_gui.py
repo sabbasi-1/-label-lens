@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from yolo_reviewer.app import ClassPickerDialog, MainWindow
 from yolo_reviewer.core import ReviewState, discover_dataset
@@ -302,6 +302,29 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertFalse(window.dirty)
         self.assertTrue(labels[0].read_text(encoding="utf-8").startswith("1 "))
         open_url.assert_called_once()
+        window.close()
+
+    def test_delete_image_and_label_moves_both_to_dataset_trash(self) -> None:
+        yaml_path, labels = self.make_dataset(
+            TEST_ROOT / "delete-image", ["cat"]
+        )
+        window = self.open_test_window(yaml_path)
+        image_path = window.current_record().image_path
+        label_path = labels[0]
+        with patch(
+            "yolo_reviewer.app.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            window.delete_current_image()
+        self.assertFalse(image_path.exists())
+        self.assertFalse(label_path.exists())
+        self.assertEqual(len(window.dataset.records), 0)
+        trash_root = window.dataset.root / ".label-lens-trash"
+        self.assertTrue(any(
+            path.name == image_path.name
+            for path in trash_root.rglob(image_path.name)
+        ))
+        self.assertEqual(window.counter.text(), "No images match this filter")
         window.close()
 
     def test_each_new_box_offers_class_override_and_cancel_keeps_inherited(self) -> None:

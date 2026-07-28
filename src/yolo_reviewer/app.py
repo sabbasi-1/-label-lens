@@ -28,6 +28,7 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QPixmap,
+    QPolygonF,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -63,12 +64,23 @@ from .core import (
     discover_dataset,
     load_labels,
     save_labels,
+    trash_record,
     validation_issues,
 )
 
 
 def copy_boxes(boxes: list[Box]) -> list[Box]:
-    return [Box(box.class_id, box.x, box.y, box.width, box.height) for box in boxes]
+    return [
+        Box(
+            box.class_id,
+            box.x,
+            box.y,
+            box.width,
+            box.height,
+            box.polygon,
+        )
+        for box in boxes
+    ]
 
 
 def class_color(class_id: int) -> QColor:
@@ -289,8 +301,26 @@ class ImageCanvas(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         for index, box in enumerate(self.boxes):
             color = class_color(box.class_id)
-            painter.setPen(QPen(color, 4 if index == self.selected else 2))
             rectangle = self._box_rect(box)
+            if box.polygon is not None:
+                image = self._draw_rect
+                polygon = QPolygonF([
+                    QPointF(
+                        image.left() + x * image.width(),
+                        image.top() + y * image.height(),
+                    )
+                    for x, y in box.polygon_points()
+                ])
+                painter.setPen(QPen(color, 4 if index == self.selected else 2))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPolygon(polygon)
+                painter.setPen(QPen(
+                    color,
+                    2 if index == self.selected else 1,
+                    Qt.PenStyle.DashLine,
+                ))
+            else:
+                painter.setPen(QPen(color, 4 if index == self.selected else 2))
             painter.drawRect(rectangle)
             name = (
                 self.names[box.class_id]
@@ -638,6 +668,12 @@ class MainWindow(QMainWindow):
         delete_action = QAction("Delete box", self)
         delete_action.triggered.connect(self.delete_selected)
         toolbar.addAction(delete_action)
+        delete_image_action = QAction("Delete image + label", self)
+        delete_image_action.setToolTip(
+            "Move this image, label, and label backup to dataset trash (Ctrl+Delete)"
+        )
+        delete_image_action.triggered.connect(self.delete_current_image)
+        toolbar.addAction(delete_image_action)
         toolbar.addSeparator()
         save_action = QAction("Save labels", self)
         save_action.setShortcut(QKeySequence.StandardKey.Save)
@@ -659,6 +695,7 @@ class MainWindow(QMainWindow):
         self._action("V", lambda: self.select_action.setChecked(True))
         self._action("C", self.choose_draw_class)
         self._action("Delete", self.delete_selected)
+        self._action("Ctrl+Delete", self.delete_current_image)
         self._action("Ctrl+Z", self.undo)
         self._action("Ctrl+Y", self.redo)
         self._action("Ctrl+Shift+Z", self.redo)
@@ -787,7 +824,9 @@ class MainWindow(QMainWindow):
             8000,
         )
 
-    def populate_split_selector(self, dataset: Dataset) -> None:
+    def populate_split_selector(
+        self, dataset: Dataset, selected_split: str = "all"
+    ) -> None:
         labels = {
             "train": "Train",
             "val": "Validation",
@@ -808,7 +847,8 @@ class MainWindow(QMainWindow):
                 f"{labels.get(split, split.title())} ({counts[split]:,})",
                 split,
             )
-        self.split_combo.setCurrentIndex(0)
+        selected_index = self.split_combo.findData(selected_split)
+        self.split_combo.setCurrentIndex(max(0, selected_index))
         self.split_combo.blockSignals(False)
 
     @Slot(str)
@@ -954,6 +994,13 @@ class MainWindow(QMainWindow):
         if not indices:
             self.position = -1
             self.counter.setText("No images match this filter")
+            self.canvas.pixmap = QPixmap()
+            self.canvas.boxes = []
+            self.canvas.selected = -1
+            self.canvas.update()
+            self.label_path_link.setText("No label file")
+            self.annotation_list.clear()
+            self.issue_list.clear()
             self.update_jump_control()
             return
         if current is not None:
@@ -1062,6 +1109,7 @@ class MainWindow(QMainWindow):
             self.annotation_list.addItem(
                 f"{index + 1}.  [{box.class_id}] {name}"
                 f"  ({box.width:.3f} x {box.height:.3f})"
+                f"{'  [polygon]' if box.polygon is not None else ''}"
             )
         self.annotation_list.setCurrentRow(selected)
         self.annotation_list.blockSignals(False)
@@ -1259,6 +1307,50 @@ class MainWindow(QMainWindow):
         record.boxes.pop(index)
         self.canvas.selected = min(index, len(record.boxes) - 1)
         self.commit_change(before, f"Deleted box {index + 1}")
+
+    def delete_current_image(self) -> None:
+        record = self.current_record()
+        record_index = self.current_record_index()
+        if record is None or self.dataset is None or record_index < 0:
+            return
+        note = (
+            "\n\nUnsaved annotation edits will be discarded."
+            if self.dirty else ""
+        )
+        choice = QMessageBox.question(
+            self,
+            "Move image and label to trash?",
+            f"Move this image and its related label file to recoverable "
+            f"dataset trash?\n\n{record.image_path.name}{note}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+        key = self.dataset.key(record)
+        selected_split = self.split_combo.currentData() or "all"
+        old_position = self.position
+        try:
+            trash_path = trash_record(self.dataset, record)
+        except OSError as exc:
+            QMessageBox.critical(self, "Delete failed", str(exc))
+            return
+        self.dataset.records.pop(record_index)
+        self.state.reviewed.discard(key)
+        self.state.flagged.discard(key)
+        if self.state.last_image == key:
+            self.state.last_image = None
+        self.state.save(self.dataset.state_path)
+        self.dirty = False
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.visible_indices = []
+        self.position = old_position
+        self.populate_split_selector(self.dataset, selected_split)
+        self.rebuild_filter()
+        self.statusBar().showMessage(
+            f"Moved image and label to {trash_path}", 10000
+        )
 
     def _apply_history(self, entry: HistoryEntry, boxes: list[Box]) -> None:
         if entry.record_index != self.current_record_index():

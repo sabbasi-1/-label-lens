@@ -12,6 +12,9 @@ annotations. It does not upload images or labels.
 - Switches directly between Train, Validation, Test, and unspecified subsets.
 - Jumps directly to any numeric position in the currently filtered queue.
 - Draws labeled bounding boxes over each image.
+- Reads mixed YOLO detection and segmentation-polygon label files.
+- Draws polygon boundaries plus editable derived bounding rectangles without
+  discarding the original mask points.
 - Clicks a box to open a searchable class-selection dialog.
 - Changes the selected box with single- or multi-digit class shortcuts.
 - Draws missing boxes and moves, resizes, or deletes existing boxes.
@@ -27,17 +30,27 @@ annotations. It does not upload images or labels.
   unknown class IDs, duplicate boxes, high-overlap boxes, tiny or huge boxes,
   and extreme aspect ratios.
 - Saves labels atomically and creates a one-time `.bak` copy of the original.
+- Moves an image, its label, and its label backup to recoverable dataset-local
+  trash when requested.
 - Keeps review progress in `.yolo-review-state.json` at the dataset root.
 
-The first version supports standard detection rows:
+The reviewer supports standard detection rows:
 
 ```text
 class_id x_center y_center width height
 ```
 
-Segmentation polygons and oriented bounding boxes are deliberately rejected rather
-than being rewritten incorrectly. If such a row is present, saving that label file
-is blocked and the original remains untouched.
+It also supports standard YOLO segmentation rows:
+
+```text
+class_id x1 y1 x2 y2 x3 y3 ...
+```
+
+Detection and polygon rows may be mixed in one file. A polygon is shown with its
+boundary and a dashed derived bounding rectangle. Relabeling preserves all polygon
+points. Moving or resizing the derived rectangle applies the same affine transform
+to the polygon. Other unsupported row shapes, including oriented boxes, remain
+blocked from saving so unknown data is not silently discarded.
 
 ## Install and run
 
@@ -98,6 +111,7 @@ individual image files, lists, or text files containing image paths.
 | Draw deliberately over the newest box | Hold Shift while dragging |
 | Leave new-box mode | V, **Select / edit**, or Escape |
 | Delete selected box | Delete |
+| Move current image and label to dataset trash | Ctrl+Delete or **Delete image + label** |
 | Save current labels | Ctrl+S |
 | Toggle reviewed | R |
 | Toggle flagged | F |
@@ -162,6 +176,11 @@ from a dirty image with confirmation, or application exit with confirmation.
 Enable **Auto-save when changing images** to save without that prompt. Saving uses
 a temporary file followed by an atomic replacement. Before the first replacement,
 `<label>.txt.bak` is created. Review status is separate from annotations.
+
+**Delete image + label** asks for confirmation, then moves the image, its label,
+and any `.bak` label into `<dataset>/.label-lens-trash/<unique-id>/`, preserving
+their relative paths. The item immediately leaves the active queue. This is
+recoverable: move those files back to their original relative paths if needed.
 
 ## High-value automation roadmap
 

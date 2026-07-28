@@ -3,13 +3,16 @@ from pathlib import Path
 
 from yolo_reviewer.core import (
     Box,
+    Dataset,
     DatasetLoadCancelled,
+    ImageRecord,
     ReviewState,
     box_quality_issues,
     discover_dataset,
     label_path_for,
     load_labels,
     save_labels,
+    trash_record,
 )
 
 TEST_TEMP_ROOT = Path(__file__).parent / ".tmp"
@@ -137,19 +140,61 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(loaded.flagged, {"images/b.jpg"})
         self.assertEqual(loaded.last_image, "images/a.jpg")
 
-    def test_save_refuses_to_drop_unsupported_rows(self) -> None:
+    def test_mixed_detection_and_polygon_rows_round_trip_safely(self) -> None:
         root = TEST_TEMP_ROOT / "unsupported"
         root.mkdir(parents=True, exist_ok=True)
         label = root / "polygon.txt"
-        original = "0 0.1 0.1 0.9 0.1 0.9 0.9 0.1 0.9\n"
+        original = (
+            "0 0.5 0.5 0.2 0.2\n"
+            "1 0.1 0.1 0.9 0.1 0.9 0.9 0.1 0.9\n"
+        )
+        label.write_text(original, encoding="utf-8")
+        boxes, issues = load_labels(label, class_count=2)
+        self.assertEqual(len(boxes), 2)
+        self.assertIsNone(boxes[0].polygon)
+        self.assertIsNotNone(boxes[1].polygon)
+        self.assertNotIn("unsupported-row", {issue.kind for issue in issues})
+        record = ImageRecord(root / "image.jpg", label, boxes, issues)
+        boxes[1].class_id = 0
+        boxes[1].x += 0.05
+        save_labels(record, class_count=2)
+        rows = label.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(rows[0].split()), 5)
+        self.assertEqual(len(rows[1].split()), 9)
+        values = [float(value) for value in rows[1].split()[1:]]
+        self.assertAlmostEqual(values[0], 0.15)
+        self.assertAlmostEqual(values[2], 0.95)
+
+    def test_save_refuses_to_drop_truly_unsupported_rows(self) -> None:
+        root = TEST_TEMP_ROOT / "malformed"
+        root.mkdir(parents=True, exist_ok=True)
+        label = root / "bad.txt"
+        original = "0 0.1 0.1 0.2 0.2 extra\n"
         label.write_text(original, encoding="utf-8")
         boxes, issues = load_labels(label, class_count=1)
-        from yolo_reviewer.core import ImageRecord
-
         record = ImageRecord(root / "image.jpg", label, boxes, issues)
         with self.assertRaises(ValueError):
             save_labels(record)
         self.assertEqual(label.read_text(encoding="utf-8"), original)
+
+    def test_trash_record_moves_image_label_and_backup_recoverably(self) -> None:
+        root = TEST_TEMP_ROOT / "trash"
+        image = root / "train" / "images" / "one.jpg"
+        label = root / "train" / "labels" / "one.txt"
+        backup = label.with_suffix(".txt.bak")
+        image.parent.mkdir(parents=True, exist_ok=True)
+        label.parent.mkdir(parents=True, exist_ok=True)
+        image.write_bytes(b"image")
+        label.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+        backup.write_text("backup\n", encoding="utf-8")
+        record = ImageRecord(image, label)
+        trash = trash_record(Dataset(root, ["person"], [record]), record)
+        self.assertFalse(image.exists())
+        self.assertFalse(label.exists())
+        self.assertFalse(backup.exists())
+        self.assertTrue((trash / "train" / "images" / "one.jpg").exists())
+        self.assertTrue((trash / "train" / "labels" / "one.txt").exists())
+        self.assertTrue((trash / "train" / "labels" / "one.txt.bak").exists())
 
     def test_quality_checks_rank_unusual_geometry_as_suspicious(self) -> None:
         issues = box_quality_issues([
