@@ -300,7 +300,8 @@ class GuiSmokeTests(unittest.TestCase):
         window.assign_class(1)
         self.assertTrue(window.dirty)
         with patch(
-            "yolo_reviewer.app.QDesktopServices.openUrl", return_value=True
+            "yolo_reviewer.ui.main_window.QDesktopServices.openUrl",
+            return_value=True,
         ) as open_url:
             window.open_current_label_file()
         self.assertFalse(window.dirty)
@@ -316,7 +317,7 @@ class GuiSmokeTests(unittest.TestCase):
         image_path = window.current_record().image_path
         label_path = labels[0]
         with patch(
-            "yolo_reviewer.app.QMessageBox.question",
+            "yolo_reviewer.ui.main_window.QMessageBox.question",
             return_value=QMessageBox.StandardButton.Yes,
         ):
             window.delete_current_image()
@@ -341,7 +342,7 @@ class GuiSmokeTests(unittest.TestCase):
         )
         window = self.open_test_window(yaml_path)
         with patch(
-            "yolo_reviewer.app.QMessageBox.question",
+            "yolo_reviewer.ui.main_window.QMessageBox.question",
             return_value=QMessageBox.StandardButton.Yes,
         ):
             self.assertTrue(
@@ -367,9 +368,11 @@ class GuiSmokeTests(unittest.TestCase):
         )
         window = self.open_test_window(yaml_path)
         with patch(
-            "yolo_reviewer.app.QMessageBox.question",
+            "yolo_reviewer.ui.main_window.QMessageBox.question",
             return_value=QMessageBox.StandardButton.Yes,
-        ), patch("yolo_reviewer.app.QMessageBox.information"):
+        ), patch(
+            "yolo_reviewer.ui.main_window.QMessageBox.information"
+        ):
             self.assertTrue(
                 window.perform_bulk_class_replace(0, 1, "split")
             )

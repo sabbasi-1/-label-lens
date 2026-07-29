@@ -257,7 +257,10 @@ class CoreTests(unittest.TestCase):
                 raise OSError("simulated write failure")
             real_save(record, class_count)
 
-        with patch("yolo_reviewer.core.save_labels", side_effect=fail_second):
+        with patch(
+            "yolo_reviewer.services.storage.save_labels",
+            side_effect=fail_second,
+        ):
             with self.assertRaises(OSError):
                 replace_class_in_records(records, 1, 0, 2)
         self.assertEqual([record.boxes[0].class_id for record in records], [1, 1])

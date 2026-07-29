@@ -203,6 +203,35 @@ shown as an indeterminate phase, followed by a determinate annotation-indexing
 bar. The operation can be cancelled. Label parsing uses a bounded worker pool to
 reduce startup time without creating one thread per image.
 
+## Code structure
+
+Label Lens is divided into UI-independent domain/services and Qt presentation
+modules:
+
+```text
+src/yolo_reviewer/
+|-- app.py                  # application bootstrap and compatibility exports
+|-- core.py                 # backward-compatible facade for the old core API
+|-- models.py               # annotation and dataset data types
+|-- formats/
+|   `-- yolo.py             # YOLO box/polygon parsing and path conventions
+|-- services/
+|   |-- dataset_loader.py   # YAML discovery, splits, and background index work
+|   |-- review_session.py   # queue filtering and multi-image scope selection
+|   |-- review_state.py     # reviewed/flagged persistence
+|   |-- storage.py          # atomic saves, backups, rollback, and trash
+|   `-- validation.py       # deterministic annotation checks
+`-- ui/
+    |-- canvas.py
+    |-- dialogs.py
+    |-- main_window.py
+    `-- workers.py
+```
+
+The models, formats, and services do not depend on Qt widgets. Existing imports
+from `yolo_reviewer.core` and `yolo_reviewer.app` remain supported through
+compatibility exports.
+
 ## Data safety
 
 By default, label files are changed only after an explicit save, navigation away
